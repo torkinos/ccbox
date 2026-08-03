@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+#
+# ccbox — run Claude Code in a Docker container.
+#
+#   ccbox build          Build the image (pass --no-cache to bypass the cache).
+#   ccbox update         Update Claude Code only (no full rebuild).
+#   ccbox auth           One-time logins (claude, gh, SSH key).
+#   ccbox [run]          Run Claude Code (default).
+#   ccbox auto           Run Claude Code in auto mode (--permission-mode auto).
+#   ccbox shell          Run a bash shell against $PWD.
+#   ccbox help           Show usage.
+#
+# Docker port of ccbox by Nikoloz Razmadze (MIT):
+#   https://github.com/ralozkolya/ccbox
+# Deviations from upstream are marked "PORT:".
+#
+# Host boundary: the current directory is the only bind mount you get by
+# default. CCBOX_DIRS and CCBOX_SKILLS add more, explicitly and one at a time.
+# All credentials live in the named volume "ccbox-home", never on the host.
+#
+# Platform access: set CCBOX_NET to your compose network (e.g.
+# "<project>_default") to join it and reach services by name.
+#
+set -euo pipefail
+
+IMAGE="${CCBOX_IMAGE:-ccbox:latest}"
+VOLUME="${CCBOX_VOLUME:-ccbox-home}"
+# PORT: podman's default rootless network is "podman"; Docker's is "bridge".
+NET="${CCBOX_NET:-bridge}"
+PORTS="${CCBOX_PORTS:-}"     # comma-separated publish specs, e.g. 3000,8080:80
+ENVS="${CCBOX_ENV:-}"        # comma-separated var NAMES to forward, e.g. GH_TOKEN
+SKILLS="${CCBOX_SKILLS:-}"   # comma-separated host dirs of skills to mount read-only
+DIRS="${CCBOX_DIRS:-}"       # comma-separated extra host dirs to mount under /mnt
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# PORT: upstream enforces rootless podman here, because rootful podman ignores
+# --userns=keep-id and the workspace mount ends up unwritable. Docker has no
+# such mode, so this just confirms the daemon is reachable.
+engine() {
+  command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
+  docker info >/dev/null 2>&1 || {
+    echo "ccbox: the Docker daemon isn't running." >&2
+    echo "  Start Docker Desktop:  open -a Docker" >&2
+    exit 1
+  }
+}
+
+# Resolve CCBOX_DIRS into one tab-separated record per directory:
+#
+#   <host-abs-path>  <container-path>  <mount-options>
+#
+# Emitted once and consumed twice — as `docker -v` flags, and as `claude
+# --add-dir` arguments — so the two views can never drift apart. Extra dirs land
+# under /mnt/<name>, deliberately outside /workspace: a mount nested inside the
+# workspace bind mount would materialise its mountpoint in your actual project
+# directory on the host.
+dir_specs() {
+  local spec path name base opts n seen=$'\n'
+  local IFS=','
+  for spec in $DIRS; do
+    [ -n "$spec" ] || continue
+
+    # Optional :ro suffix (":rw" accepted and is the default).
+    opts=""
+    case "$spec" in
+      *:ro) spec="${spec%:ro}"; opts="ro" ;;
+      *:rw) spec="${spec%:rw}" ;;
+    esac
+
+    # In an unquoted assignment the shell tilde-expands only the FIRST path —
+    # `CCBOX_DIRS=~/a,~/b` leaves "~/b" literal — so expand it here too.
+    path="$spec"
+    case "$path" in
+      "~")   path="$HOME" ;;
+      "~/"*) path="$HOME/${path#\~/}" ;;
+    esac
+
+    if [ ! -d "$path" ]; then
+      echo "ccbox: CCBOX_DIRS: no such directory: $spec" >&2
+      continue
+    fi
+    # Docker reads a NON-absolute -v source as a named volume and silently
+    # creates an empty one instead of mounting your directory. Always absolute.
+    path="$(cd "$path" && pwd -P)"
+
+    if [ "$path" = "$PWD" ]; then
+      echo "ccbox: CCBOX_DIRS: skipping $spec (already mounted at /workspace)" >&2
+      continue
+    fi
+
+    # Name the mount after the directory, disambiguating collisions (~/a/src and
+    # ~/b/src both want /mnt/src) as src, src-2, src-3 ...
+    base="$(basename "$path")"
+    name="$base"
+    n=1
+    while case "$seen" in *$'\n'"$name"$'\n'*) true ;; *) false ;; esac; do
+      n=$((n + 1))
+      name="$base-$n"
+    done
+    seen="$seen$name"$'\n'
+
+    if [ "$(uname -s)" = Linux ] && [ -d /sys/fs/selinux ]; then
+      opts="${opts:+$opts,}z"
+    fi
+
+    printf '%s\t%s\t%s\n' "$path" "/mnt/$name" "$opts"
+  done
+}
+
+# Shared run flags. Only $PWD crosses the host boundary; the home volume is
+# Docker-managed storage, not a host path.
+#
+# Git worktrees: launch ccbox from the main repo root (not from inside a
+# worktree dir) so the repo — including worktrees nested under it, e.g.
+# .claude/worktrees/<name> — is mounted as a unit at /workspace. The bundled
+# git defaults to worktree.useRelativePaths, so worktrees created in the
+# container record relative links and resolve both here and on the host.
+run_flags() {
+  # PORT: upstream passes --userns=keep-id:uid=1000,gid=1000 so files written
+  # into the workspace stay owned by you. Docker has no keep-id. On macOS it
+  # isn't needed: Docker Desktop's virtiofs maps the container uid back to the
+  # host user automatically (verified — a file written as uid 1000 inside lands
+  # owned by the host user outside).
+  #
+  # On Linux, Docker does NOT remap: files would land owned by uid 1000. If your
+  # host uid isn't 1000, set CCBOX_USER="$(id -u):$(id -g)" to run as yourself.
+  local userflag=()
+  if [ -n "${CCBOX_USER:-}" ]; then
+    userflag=(--user "$CCBOX_USER")
+  fi
+
+  # SELinux: :z applies a SHARED label so concurrent containers on the same repo
+  # can coexist (:Z would give one container an exclusive MCS category and lock
+  # the others out of their own workspace). Skipped off Linux — macOS virtiofs
+  # stores no SELinux xattrs, so the relabel walk is pure cost and on a large
+  # repo it pegs the VM.
+  local relabel=""
+  if [ "$(uname -s)" = Linux ] && [ -d /sys/fs/selinux ]; then
+    relabel=":z"
+  fi
+
+  printf '%s\n' \
+    --rm -it \
+    ${userflag[@]+"${userflag[@]}"} \
+    --network "$NET" \
+    -v "$PWD":/workspace"$relabel" \
+    -v "$VOLUME":/home/node \
+    -w /workspace
+
+  # Forward CCBOX_ENV: comma-separated variable NAMES, not name=value pairs.
+  # `docker run -e GH_TOKEN` (bare name) makes Docker read the value from this
+  # shell's environment, so the secret never appears on the command line, in
+  # your shell history, or in `ps` output. It IS still visible via
+  # `docker inspect` on the running container — see README.
+  local var
+  local IFS=', '
+  for var in $ENVS; do
+    [ -n "$var" ] || continue
+    case "$var" in
+      *=*) echo "ccbox: CCBOX_ENV takes variable NAMES, not name=value ('$var')" >&2; exit 2 ;;
+    esac
+    printf '%s\n%s\n' --env "$var"
+  done
+
+  # Publish CCBOX_PORTS: docker --publish specs, comma-separated so the value
+  # needs no quoting. Spaces are tolerated; the guard covers a stray comma.
+  local spec port
+  for spec in $PORTS; do
+    [ -n "$spec" ] || continue
+    # A bare "3000" publishes to a *random* host port; map it to itself.
+    case "$spec" in
+      *:*) ;;
+      *) port="${spec%%/*}"
+         case "$port" in ''|*[!0-9-]*) ;; *) spec="$port:$spec" ;; esac ;;
+    esac
+    printf '%s\n%s\n' --publish "$spec"
+  done
+
+  # Mount personal skills read-only into ~/.claude/skills.
+  #
+  # Each skill directory is mounted INDIVIDUALLY, on purpose. A single mount at
+  # ~/.claude/skills would shadow the whole directory, hiding anything already
+  # installed inside the volume. Per-skill mounts are additive: yours appear
+  # alongside whatever is already there, and a skill added to the source repo is
+  # picked up on the next run with no rebuild.
+  #
+  # Comma-separated only (not space), since paths may legitimately contain spaces.
+  local sdir skill sname
+  IFS=','
+  for sdir in $SKILLS; do
+    [ -n "$sdir" ] || continue
+    if [ ! -d "$sdir" ]; then
+      echo "ccbox: CCBOX_SKILLS: no such directory: $sdir" >&2
+      continue
+    fi
+    for skill in "$sdir"/*/; do
+      # A directory is a skill only if it actually holds a SKILL.md.
+      [ -f "${skill}SKILL.md" ] || continue
+      sname="$(basename "$skill")"
+      printf '%s\n%s\n' -v "${skill%/}:/home/node/.claude/skills/${sname}:ro"
+    done
+  done
+
+  # Extra host directories (CCBOX_DIRS), mounted under /mnt.
+  local hostp contp dopts
+  while IFS=$'\t' read -r hostp contp dopts; do
+    [ -n "$hostp" ] || continue
+    printf '%s\n%s\n' -v "$hostp:$contp${dopts:+:$dopts}"
+  done < <(dir_specs)
+}
+
+# Claude Code arguments for the CCBOX_DIRS mounts. Mounting a directory only
+# makes it visible; --add-dir is what makes it a working directory Claude can
+# read and edit without a prompt per file.
+#
+# dir_specs runs a second time here (stderr muted so its warnings print once).
+# It has to: run_flags executes inside a process substitution, so anything it
+# computed is lost with that subshell.
+load_add_dirs() {
+  ADD_DIRS=()
+  local hostp contp dopts
+  while IFS=$'\t' read -r hostp contp dopts; do
+    [ -n "$contp" ] || continue
+    ADD_DIRS+=("$contp")
+  done < <(dir_specs 2>/dev/null)
+  [ ${#ADD_DIRS[@]} -eq 0 ] || ADD_DIRS=(--add-dir "${ADD_DIRS[@]}")
+}
+
+# Populate the global FLAGS array from run_flags. Portable stand-in for
+# `mapfile -t FLAGS < <(run_flags)`: macOS ships bash 3.2, which predates the
+# mapfile/readarray builtin, so that fails with "mapfile: command not found".
+load_flags() {
+  FLAGS=()
+  while IFS= read -r line; do
+    FLAGS+=("$line")
+  done < <(run_flags)
+}
+
+cmd_help() {
+  cat <<'EOF'
+ccbox — run Claude Code in a Docker container.
+
+Usage:
+  ccbox build [args]   Build the image. Extra args pass to `docker build`,
+                       e.g. `ccbox build --no-cache` to bypass the layer cache.
+                       First build takes a few minutes (git is compiled).
+  ccbox update [ver]   Update Claude Code to the latest release (or to [ver]).
+                       Rebuilds only the Claude Code layer — seconds, not a
+                       full image rebuild.
+  ccbox auth           One-time logins (claude, gh, SSH key).
+  ccbox [run] [args]   Run Claude Code (default). Extra args pass to claude.
+  ccbox auto [args]    Run Claude Code in auto mode (--permission-mode auto).
+  ccbox shell          Open a bash shell against $PWD.
+  ccbox help           Show this help.
+
+Environment:
+  CCBOX_IMAGE   Image tag           (default: ccbox:latest)
+  CCBOX_VOLUME  Home volume name    (default: ccbox-home)
+  CCBOX_NET     Docker network      (default: bridge)
+  CCBOX_PORTS   Ports to publish to the host, comma-separated
+                (e.g. CCBOX_PORTS=3000,8080:80 ccbox)
+  CCBOX_ENV     Variable NAMES to forward from your shell, comma-separated
+                (e.g. GH_TOKEN=... CCBOX_ENV=GH_TOKEN ccbox)
+  CCBOX_SKILLS  Host dirs holding skills, comma-separated. Every subdirectory
+                containing a SKILL.md is mounted read-only into
+                ~/.claude/skills, alongside whatever is already there.
+  CCBOX_DIRS    Extra host dirs to work on, comma-separated. Each is mounted at
+                /mnt/<name> and passed to claude as --add-dir, so it is a full
+                working directory. Append :ro for read-only.
+                (e.g. CCBOX_DIRS=~/work/api,~/work/shared:ro ccbox)
+  CCBOX_USER    Run as uid:gid      (Linux only; see README)
+
+The current directory is bind-mounted at /workspace; nothing else from the
+host is mounted unless you ask for it via CCBOX_DIRS or CCBOX_SKILLS.
+Credentials live in the named volume (default "ccbox-home"), never on the host.
+EOF
+}
+
+cmd_build() {
+  engine
+  # Extra args pass through to `docker build`, e.g. `ccbox build --no-cache`.
+  docker build "$@" -t "$IMAGE" "$HERE"
+}
+
+# Update Claude Code without a full rebuild.
+#
+# Claude Code's own updater can't run here — npm's global dir is root-owned and
+# the container runs as node, so it fails with "no_permissions" and the image
+# stays pinned to whatever it was built with. Instead, resolve the wanted
+# version and pass it as CC_VERSION: only that RUN layer (and the trivial COPY
+# after it) is invalidated, so the tools layer — git built from source — is
+# reused. Already on the latest? The build-arg is unchanged, the layer cache
+# hits, and this is a no-op.
+cmd_update() {
+  engine
+  local want="${1:-}"
+  if [ -z "$want" ]; then
+    echo "Resolving latest @anthropic-ai/claude-code ..."
+    want="$(docker run --rm "$IMAGE" npm view @anthropic-ai/claude-code version | tr -d '[:space:]')"
+  fi
+  case "$want" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "not a valid version: '$want'" >&2; exit 1 ;;
+  esac
+
+  echo "Building $IMAGE with Claude Code $want ..."
+  docker build --build-arg "CC_VERSION=$want" -t "$IMAGE" "$HERE"
+  docker run --rm "$IMAGE" claude --version
+}
+
+# First-run setup: drop into a shell with guidance and generate a dedicated SSH
+# key inside the volume if missing.
+#
+# PORT: upstream also registers an Atlassian MCP server here. Dropped — it
+# points at a third-party endpoint that isn't part of this project.
+cmd_auth() {
+  engine
+  load_flags
+  docker run "${FLAGS[@]}" "$IMAGE" bash -lc '
+    set -e
+
+    # Dedicated SSH key in the persisted volume — the host ~/.ssh is never used
+    # and never mounted, so this key is the container'"'"'s own identity.
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    if [ ! -f ~/.ssh/id_ed25519 ]; then
+      ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "ccbox-agent"
+      [ -f ~/.ssh/config ] || printf "Host *\n  AddKeysToAgent yes\n" > ~/.ssh/config
+      chmod 600 ~/.ssh/config
+    fi
+
+    echo
+    echo "=== ccbox first-run setup ==="
+    echo "Run these once; everything persists in the ccbox-home volume:"
+    echo "  claude            # sign in to your subscription, then /exit"
+    echo "  gh auth login"
+    echo
+    echo "If the browser sign-in completes but nothing happens in here, copy the"
+    echo "code from the browser and paste it at the prompt."
+    echo
+    echo "Add this SSH public key to GitHub / your git hosts (optional):"
+    echo "-----------------------------------------------------------------"
+    cat ~/.ssh/id_ed25519.pub
+    echo "-----------------------------------------------------------------"
+    echo
+    exec bash -l
+  '
+}
+
+# --add-dir goes LAST, after the user's own arguments. It is variadic
+# (`--add-dir <directories...>`), so it swallows every following bare word: put
+# it first and `ccbox "fix the tests"` would parse that prompt as a directory
+# name. Nothing follows it at the end, so there is nothing left to swallow.
+cmd_run() {
+  engine
+  load_flags
+  load_add_dirs
+  docker run "${FLAGS[@]}" "$IMAGE" claude "$@" ${ADD_DIRS[@]+"${ADD_DIRS[@]}"}
+}
+
+cmd_auto() {
+  engine
+  load_flags
+  load_add_dirs
+  docker run "${FLAGS[@]}" "$IMAGE" claude --permission-mode auto "$@" ${ADD_DIRS[@]+"${ADD_DIRS[@]}"}
+}
+
+cmd_shell() {
+  engine
+  load_flags
+  docker run "${FLAGS[@]}" "$IMAGE" bash -l
+}
+
+# Dispatch. Note "${1:-}" and not "${1:-run}": the latter *expands* to "run"
+# without setting $1, so with no arguments `shift` runs against an empty
+# positional list, fails, and `set -e` kills the script before cmd_run is
+# reached — bare `ccbox` silently exits 1. Matching "" against *) instead means
+# no-args falls through to cmd_run with an empty "$@", and every branch that
+# shifts is guaranteed at least one positional. (Upstream has this bug.)
+case "${1:-}" in
+  build)            shift; cmd_build "$@" ;;
+  update)           shift; cmd_update "$@" ;;
+  auth)             shift; cmd_auth "$@" ;;
+  auto)             shift; cmd_auto "$@" ;;
+  shell)            shift; cmd_shell "$@" ;;
+  run)              shift; cmd_run "$@" ;;
+  help|-h|--help)   cmd_help ;;
+  *)                cmd_run "$@" ;;   # no args, or unknown args → claude
+esac
