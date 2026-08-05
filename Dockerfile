@@ -37,11 +37,28 @@ RUN npm install -g @anthropic-ai/claude-code@${CC_VERSION}
 # nothing in ~/.claude or a project's .claude/ can override it.
 COPY managed-settings.json /etc/claude-code/managed-settings.json
 
+# --- egress firewall ------------------------------------------------------
+# Opt-in, off unless the launcher passes CCBOX_FIREWALL=on. Both scripts live in
+# root-owned /usr/local/bin — inside the image, never on a volume — so the
+# `node` user cannot rewrite the thing that confines it. /etc/ccbox is the
+# mount point for an optional host-supplied allowlist; it is deliberately NOT
+# under /workspace, /home/node or /mnt, all of which the agent can write.
+COPY ccbox-entrypoint ccbox-init-firewall /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/ccbox-entrypoint /usr/local/bin/ccbox-init-firewall \
+ && mkdir -p /etc/ccbox
+
 # --- non-root runtime user ------------------------------------------------
 # The base image's built-in `node` user (uid 1000, home /home/node). Never root:
 # Claude Code refuses --dangerously-skip-permissions as root, and root would
 # leave root-owned files in your bind-mounted repo.
+#
+# This stays even with the firewall on. In that mode the launcher overrides it
+# with `--user 0:0` so the entrypoint can install iptables rules, and the
+# entrypoint immediately drops back to uid 1000 with setpriv — CapEff and CapBnd
+# both zero. With the firewall off nothing is overridden, the entrypoint sees it
+# is not root, and execs straight through.
 USER node
 
 WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/ccbox-entrypoint"]
 CMD ["claude"]

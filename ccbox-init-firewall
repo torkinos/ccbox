@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+#
+# ccbox-init-firewall — default-deny egress allowlist for the ccbox container.
+#
+# Run as root by ccbox-entrypoint, once, before privileges are dropped to uid
+# 1000. The `node` user gets no capabilities and there is no sudo, so nothing
+# that executes in the sandbox afterwards can inspect these rules away.
+#
+# Everything fails CLOSED. A domain that won't resolve, an empty ipset, a
+# missing capability, a self-test that doesn't hold — all exit non-zero, and the
+# entrypoint runs under `set -e`, so the container dies rather than coming up
+# with open egress. A firewall that fails open is worse than no firewall,
+# because you think you have one.
+#
+# ALL output goes to stderr. `ccbox update` captures the container's stdout
+# (see cmd_update in the launcher), and a stray log line there would be spliced
+# into a version string.
+#
+# Derived from Anthropic's .devcontainer/init-firewall.sh. The deviations —
+# IPv6, scoped SSH, scoped DNS, no sudo, fail-closed, filter-table-only — are
+# documented in README "Egress firewall".
+#
+#   ccbox-init-firewall             apply the rules, verify, exit
+#   ccbox-init-firewall --refresh   re-resolve on a loop (backgrounded by the
+#                                   entrypoint; additive, never widens)
+
+set -euo pipefail
+umask 022
+
+LOG=/var/log/ccbox-firewall.log
+LOG_STDERR=1
+
+log() {
+  local m="[ccbox-firewall] $*"
+  [ "$LOG_STDERR" = 1 ] && printf '%s\n' "$m" >&2
+  # Braces so that 2>/dev/null also swallows bash's own "permission denied" for
+  # a failed redirection — putting it on the printf alone would be too late.
+  { printf '%s\n' "$m" >>"$LOG"; } 2>/dev/null || true
+  return 0
+}
+die() { log "FATAL: $*"; exit 1; }
+
+ipt()  { iptables  -w "$@"; }
+ipt6() { ip6tables -w "$@"; }
+
+# --- configuration, read once as root -------------------------------------
+# Every one of these arrives from the host at `docker run` time. Nothing here
+# is read from /workspace, /home/node or /mnt: those are writable by the agent,
+# and an allowlist it can edit is not an allowlist (cf. GHSA-mmgp-wc2j-qcv7).
+ALLOWLIST_FILE=/etc/ccbox/allowed-domains
+ALLOWED_PORTS="${CCBOX_ALLOWED_PORTS:-80,443}"
+LOCAL_ACCESS="${CCBOX_FIREWALL_LOCAL:-subnet}"
+REFRESH_SECONDS="${CCBOX_FIREWALL_REFRESH:-1800}"
+INBOUND_PORTS="${CCBOX_FW_INPORTS:-}"
+EXTRA_DNS="${CCBOX_DNS:-}"
+
+SET_ALLOW=ccbox-allow
+SET_SSH=ccbox-gh-ssh
+
+# --- baked-in allowlist ----------------------------------------------------
+# Host names only — resolved to IPv4 at boot and re-resolved on every refresh.
+# A name that resolves to nothing is fatal, not a warning.
+DEFAULT_DOMAINS="
+  # Claude Code itself
+  api.anthropic.com
+  statsig.anthropic.com
+  statsig.com
+  sentry.io
+  claude.ai                 # MCP connectors that route through claude.ai
+
+  # GitHub. The CIDRs from api.github.com/meta are added separately and are
+  # what actually carries git traffic; these cover the host names directly.
+  github.com                # also the Claude Code plugin marketplace
+  api.github.com
+  codeload.github.com
+  raw.githubusercontent.com
+  objects.githubusercontent.com
+  ssh.github.com            # SSH over 443, for networks that filter 22
+
+  # Package registries
+  registry.npmjs.org
+  registry.yarnpkg.com
+  repo.yarnpkg.com
+
+  # Figma MCP: www/api serve metadata, the S3 hosts serve image assets
+  www.figma.com
+  api.figma.com
+  figma-alpha-api.s3.us-west-2.amazonaws.com
+  s3-alpha-sig.figma.com
+"
+
+# ---------------------------------------------------------------------------
+# Stage 0 — preconditions
+# ---------------------------------------------------------------------------
+
+preflight() {
+  [ "$(id -u)" -eq 0 ] || die "must run as root; this is the entrypoint's job"
+  [ -e /.dockerenv ] || die "refusing to run outside a container"
+
+  # Host (or shared) networking puts us in someone else's network namespace,
+  # where these rules would rewrite the HOST's filter table — flushing
+  # DOCKER-USER and FORWARD and breaking every container on the machine. The
+  # launcher refuses this too; this is the second lock on the same door.
+  case "${CCBOX_NET_MODE:-}" in
+    host|container:*)
+      die "CCBOX_NET=${CCBOX_NET_MODE} shares another network namespace — refusing" ;;
+  esac
+
+  local b
+  for b in iptables ip6tables ipset dig curl jq aggregate ip getent; do
+    command -v "$b" >/dev/null 2>&1 || die "missing binary: $b (rebuild the image)"
+  done
+
+  ipt -L -n >/dev/null 2>&1 \
+    || die "no CAP_NET_ADMIN — the container needs --cap-add=NET_ADMIN"
+
+  case "$LOCAL_ACCESS" in
+    subnet|gateway|off) ;;
+    *) die "CCBOX_FIREWALL_LOCAL must be subnet, gateway or off (got '$LOCAL_ACCESS')" ;;
+  esac
+  case "$ALLOWED_PORTS" in
+    ''|*[!0-9,:-]*) die "CCBOX_ALLOWED_PORTS must be a comma-separated port list (got '$ALLOWED_PORTS')" ;;
+  esac
+}
+
+# bookworm's iptables defaults to the nft backend, which reaches ipset through
+# nft_compat + xt_set. That is fine on Docker Desktop (both built in), but on a
+# native host ip_set/xt_set are modules and a container cannot load them — if
+# the host won't autoload, the rules would assemble cleanly and match nothing.
+# Prove the match works on a scratch chain before betting the allowlist on it.
+probe_ipset_match() {
+  local p=ccbox-probe rc=0
+  ipset destroy "$p" 2>/dev/null || true
+  ipt -F "$p" 2>/dev/null || true
+  ipt -X "$p" 2>/dev/null || true
+
+  ipset create "$p" hash:net family inet 2>/dev/null || return 1
+  if ipt -N "$p" 2>/dev/null; then
+    ipt -A "$p" -m set --match-set "$p" dst -j ACCEPT 2>/dev/null \
+      && ipt -S "$p" 2>/dev/null | grep -q -- '--match-set ccbox-probe dst' \
+      || rc=1
+    ipt -F "$p" 2>/dev/null || true
+    ipt -X "$p" 2>/dev/null || true
+  else
+    rc=1
+  fi
+  ipset destroy "$p" 2>/dev/null || true
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 1 — the allowlist
+# ---------------------------------------------------------------------------
+
+# Normalise a blob of host names (newline- or comma-separated, '#' comments
+# allowed) to one validated host per line. Anything that is not a plain host
+# name is fatal: a CIDR, URL, IP or glob would quietly not mean what whoever
+# wrote it meant, and quietly-wrong is the failure mode this whole file exists
+# to avoid.
+normalise_domains() {
+  local src="$1" blob entry
+  local IFS
+  # Commas, spaces, tabs and newlines all separate entries. Blanks are turned
+  # into separators rather than deleted: stripping them would quietly weld
+  # "foo bar" into the perfectly valid-looking host name "foobar".
+  blob="$(printf '%s\n' "$2" | sed 's/#.*//' | tr ',' '\n' | tr ' \t' '\n\n')"
+  IFS=$'\n'
+  set -f                                   # an entry of "*" must not glob
+  for entry in $blob; do
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      *[!A-Za-z0-9.-]* | -* | .* | *. | *..*)
+        set +f; die "$src: not a host name: '$entry'" ;;
+    esac
+    case "$entry" in
+      *[!0-9.]*) ;;                        # has a letter or dash: a real name
+      *) set +f; die "$src: use host names, not IP addresses: '$entry'" ;;
+    esac
+    printf '%s\n' "$entry"
+  done
+  set +f
+}
+
+build_domain_list() {
+  local blob="$DEFAULT_DOMAINS" sources="image defaults"
+
+  if [ -e "$ALLOWLIST_FILE" ]; then
+    # This file is the one config input that lives on disk, so it gets checked.
+    # It must be a real, root-owned, non-group/other-writable file: if anything
+    # running as `node` can rewrite it, the sandbox can widen its own egress on
+    # the next boot, which is precisely the hole we are closing.
+    if [ -L "$ALLOWLIST_FILE" ]; then die "$ALLOWLIST_FILE is a symlink — refusing"; fi
+    [ -f "$ALLOWLIST_FILE" ] || die "$ALLOWLIST_FILE is not a regular file"
+    [ "$(stat -c '%u' "$ALLOWLIST_FILE")" = 0 ] \
+      || die "$ALLOWLIST_FILE must be owned by root"
+    [ -z "$(find "$ALLOWLIST_FILE" -maxdepth 0 -perm /022)" ] \
+      || die "$ALLOWLIST_FILE is group- or world-writable — refusing"
+    blob="$blob
+$(cat "$ALLOWLIST_FILE")"
+    sources="$sources, $ALLOWLIST_FILE"
+  fi
+
+  if [ -n "${CCBOX_ALLOWED_DOMAINS:-}" ]; then
+    blob="$blob
+$CCBOX_ALLOWED_DOMAINS"
+    sources="$sources, CCBOX_ALLOWED_DOMAINS"
+  fi
+
+  log "allowlist sources: $sources"
+  normalise_domains "allowlist" "$blob" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2 — resolve, while egress is still open
+# ---------------------------------------------------------------------------
+
+resolve_a() {
+  dig +noall +answer +time=3 +tries=2 A "$1" 2>/dev/null | awk '$4 == "A" { print $5 }'
+}
+
+# IPv4 CIDRs for a jq selector over api.github.com/meta. IPv6 is filtered out in
+# jq rather than regex-checked afterwards: `aggregate` silently drops lines it
+# can't parse, so a post-hoc check never sees them and the intent is invisible.
+github_cidrs() {
+  printf '%s' "$GH_META" | jq -r "$1"' | select(test(":") | not)' | aggregate -q
+}
+
+# Nameservers we are allowed to talk to on port 53. Blanket --dport 53 (what the
+# reference script does) is an exfiltration channel in its own right.
+#
+# Two shapes: on the default bridge network resolv.conf holds a real resolver
+# address, and allowing it is the whole story. On a user-defined network it
+# holds 127.0.0.11 — Docker's embedded resolver — which forwards upstream from
+# *inside* this netns, out eth0, to an address we cannot see from in here. That
+# forward has to be allowed or DNS dies; CCBOX_DNS names it explicitly, and
+# failing that we allow uid-0 sockets on port 53, which is dockerd's forward and
+# not anything the agent can open.
+collect_nameservers() {
+  local ns
+  for ns in $(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf 2>/dev/null); do
+    case "$ns" in
+      127.0.0.11) NEEDS_EMBEDDED_DNS=1 ;;
+      *:*) ;;                                   # IPv6 resolver: v6 is rejected
+      *) NAMESERVERS="${NAMESERVERS:+$NAMESERVERS }$ns" ;;
+    esac
+  done
+  local d
+  local IFS=', '
+  for d in $EXTRA_DNS; do
+    [ -n "$d" ] || continue
+    NAMESERVERS="${NAMESERVERS:+$NAMESERVERS }$d"
+    NEEDS_EMBEDDED_DNS=0
+  done
+  [ -n "$NAMESERVERS" ] || [ "$NEEDS_EMBEDDED_DNS" = 1 ] \
+    || die "no usable IPv4 nameserver in /etc/resolv.conf; set CCBOX_DNS"
+}
+
+# The container's own attached network. Everything on it is host-local: the
+# bridge gateway, sibling containers on a user-defined CCBOX_NET, and the source
+# of traffic to published CCBOX_PORTS. None of it is internet egress.
+collect_local_nets() {
+  case "$LOCAL_ACCESS" in
+    subnet)
+      LOCAL_NETS="$(ip -o -4 route show scope link 2>/dev/null | awk '{print $1}')"
+      [ -n "$LOCAL_NETS" ] \
+        || LOCAL_NETS="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}')"
+      ;;
+    gateway)
+      LOCAL_NETS="$(ip -o -4 route show default 2>/dev/null | awk '{print $3"/32"; exit}')"
+      ;;
+    off) LOCAL_NETS="" ;;
+  esac
+
+  # host.docker.internal sits on the Docker Desktop VM network, not the
+  # container's subnet, so it needs its own rule. Figma Route A (README) talks
+  # to the desktop app's MCP server there. Best effort: on native Linux it only
+  # resolves if the launcher was given --add-host.
+  if [ "$LOCAL_ACCESS" != off ]; then
+    local hdi
+    hdi="$(getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1; exit}' || true)"
+    if [ -n "$hdi" ]; then
+      LOCAL_NETS="${LOCAL_NETS}
+${hdi}/32"
+    fi
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3 — ipsets
+# ---------------------------------------------------------------------------
+
+# -t is terse: the header only. Without it this dumps every member, and the
+# GitHub ranges alone run to hundreds of lines.
+set_count() { ipset list -t "$1" 2>/dev/null | sed -n 's/^Number of entries: //p'; }
+
+populate_sets() {
+  local cidr ip d ips
+  local IFS                                # localised: restored on return
+
+  # Order matters: the filter rules were flushed first. nft_compat holds a
+  # reference to a set while a rule mentions it, and `ipset destroy` fails with
+  # "it is in use by a kernel component" if you get this backwards.
+  ipset destroy "$SET_ALLOW" 2>/dev/null || true
+  ipset destroy "$SET_SSH" 2>/dev/null || true
+  ipset create "$SET_ALLOW" hash:net family inet
+  ipset create "$SET_SSH" hash:net family inet
+
+  for cidr in $GH_CIDRS;     do ipset -exist add "$SET_ALLOW" "$cidr"; done
+  for cidr in $GH_SSH_CIDRS; do ipset -exist add "$SET_SSH" "$cidr"; done
+
+  IFS=$'\n'
+  for d in $DOMAINS; do
+    ips="$(resolve_a "$d")"
+    [ -n "$ips" ] || die "could not resolve $d — refusing to start with a partial allowlist"
+    for ip in $ips; do
+      case "$ip" in
+        *[!0-9.]*) die "bogus A record for $d: '$ip'" ;;
+      esac
+      ipset -exist add "$SET_ALLOW" "$ip"
+    done
+    log "  resolved $d -> $(printf '%s' "$ips" | tr '\n' ' ')"
+  done
+
+  [ "$(set_count "$SET_ALLOW")" -gt 0 ] || die "the allowlist ipset is empty"
+  [ "$(set_count "$SET_SSH")" -gt 0 ]   || die "the GitHub SSH ipset is empty"
+  log "ipsets: $SET_ALLOW=$(set_count "$SET_ALLOW") entries, $SET_SSH=$(set_count "$SET_SSH") entries"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 4 — rules
+# ---------------------------------------------------------------------------
+
+apply_ipv4() {
+  local ns p net
+  local IFS                                # localised: restored on return
+  # filter ONLY. nat and mangle are deliberately untouched: on a user-defined
+  # network Docker's embedded-DNS DNAT lives in nat, and the reference script's
+  # save-grep-replay of those rules is a restore dance we simply don't need.
+  # It also sidesteps the legacy/nft split-brain when dockerd and the container
+  # disagree about backends.
+  ipt -F
+  ipt -X
+
+  ipt -A INPUT  -i lo -j ACCEPT
+  ipt -A OUTPUT -o lo -j ACCEPT
+  ipt -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ipt -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  for ns in $NAMESERVERS; do
+    ipt -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT
+    ipt -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT
+    log "DNS allowed to $ns"
+  done
+  if [ "$NEEDS_EMBEDDED_DNS" = 1 ]; then
+    # Docker's embedded resolver forwards from inside this netns as uid 0. The
+    # agent runs as uid 1000 and cannot open a uid-0 socket, so this does not
+    # give it a path to an arbitrary resolver.
+    if ipt -A OUTPUT -p udp --dport 53 -m owner --uid-owner 0 -j ACCEPT 2>/dev/null \
+    && ipt -A OUTPUT -p tcp --dport 53 -m owner --uid-owner 0 -j ACCEPT 2>/dev/null; then
+      log "DNS allowed for Docker's embedded resolver (uid 0, port 53)"
+    else
+      die "this kernel has no xt_owner match, so Docker's embedded resolver (127.0.0.11) cannot forward. Set CCBOX_DNS to your upstream resolver's IP."
+    fi
+  fi
+
+  IFS=$'\n'
+  for net in $LOCAL_NETS; do
+    [ -n "$net" ] || continue
+    ipt -A OUTPUT -d "$net" -j ACCEPT
+    ipt -A INPUT  -s "$net" -j ACCEPT
+    log "local network allowed: $net"
+  done
+
+  # Published ports (CCBOX_PORTS). The bridge-subnet rule above covers this on
+  # Docker Desktop, where the userland proxy re-originates from the gateway, but
+  # not with "userland-proxy": false or on a native host, where DNAT preserves
+  # the real client address. Open the container-side ports explicitly.
+  IFS=','
+  for p in $INBOUND_PORTS; do
+    case "$p" in ''|*[!0-9-]*) continue ;; esac
+    ipt -A INPUT -p tcp --dport "$p" -j ACCEPT
+    log "published port allowed inbound: tcp/$p"
+  done
+
+  ipt -A OUTPUT -p tcp -m set --match-set "$SET_ALLOW" dst \
+      -m multiport --dports "$ALLOWED_PORTS" -j ACCEPT
+  # SSH only to GitHub's git CIDRs. The reference allows --dport 22 to anywhere,
+  # which is a fully general exfiltration channel.
+  ipt -A OUTPUT -p tcp --dport 22 -m set --match-set "$SET_SSH" dst -j ACCEPT
+
+  ipt -P INPUT DROP
+  ipt -P FORWARD DROP
+  ipt -P OUTPUT DROP
+
+  # Explicit REJECT so blocked calls fail immediately with EACCES rather than
+  # hanging until some timeout. The DROP policy stays as the backstop.
+  ipt -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+}
+
+# The reference script is IPv4-only. On a container with working IPv6 that
+# leaves the entire allowlist bypassable, so this is not optional.
+#
+# Note that disabling IPv6 *addressing* does not disable the IPv6 netfilter
+# machinery: ip6tables keeps working. The two conditions are independent and
+# have to be tested separately.
+ipv6_reachable() {
+  [ -e /proc/net/if_inet6 ] || return 1
+  [ -n "$(ip -6 route show default 2>/dev/null)" ] && return 0
+  [ -n "$(ip -6 -o addr show scope global 2>/dev/null)" ] && return 0
+  return 1
+}
+
+apply_ipv6() {
+  if ipt6 -L -n >/dev/null 2>&1; then
+    ipt6 -F
+    ipt6 -X
+    ipt6 -A INPUT  -i lo -j ACCEPT
+    ipt6 -A OUTPUT -o lo -j ACCEPT
+    ipt6 -A OUTPUT -j REJECT --reject-with adm-prohibited
+    ipt6 -P INPUT DROP
+    ipt6 -P FORWARD DROP
+    ipt6 -P OUTPUT DROP
+    log "IPv6: rejected except loopback"
+    return 0
+  fi
+  # Couldn't install v6 rules. Acceptable only if there is no v6 to filter —
+  # otherwise the allowlist has a hole the size of the internet.
+  ipv6_reachable && die "IPv6 is reachable but ip6tables is unavailable — refusing to start"
+  log "IPv6: unavailable in this container, nothing to filter"
+}
+
+# ---------------------------------------------------------------------------
+# Stage 5 — prove it
+# ---------------------------------------------------------------------------
+#
+# Rules are not uid-scoped, so root's view here is the same view `node` gets.
+# A ruleset can assemble cleanly and still match nothing (see the ipset probe),
+# and this is the only check that catches that.
+
+self_test() {
+  if curl -s --connect-timeout 5 -o /dev/null https://example.com; then
+    die "self-test failed: https://example.com is still reachable"
+  fi
+  if curl -s -6 --connect-timeout 5 -o /dev/null https://example.com; then
+    die "self-test failed: https://example.com is reachable over IPv6"
+  fi
+  curl -s --connect-timeout 10 -o /dev/null https://api.anthropic.com \
+    || die "self-test failed: https://api.anthropic.com is NOT reachable"
+  curl -s --connect-timeout 10 -o /dev/null https://api.github.com/zen \
+    || die "self-test failed: https://api.github.com is NOT reachable"
+  log "self-test passed: allowlist reachable, everything else rejected"
+}
+
+# ---------------------------------------------------------------------------
+
+fetch_github_meta() {
+  GH_META="$(curl -fsS --max-time 20 https://api.github.com/meta)" \
+    || die "could not fetch https://api.github.com/meta"
+  printf '%s' "$GH_META" | jq -e '.web and .api and .git' >/dev/null \
+    || die "api.github.com/meta is missing .web/.api/.git"
+
+  # Capture and check, rather than reading straight from a process substitution:
+  # neither `set -e` nor pipefail sees a failure inside one, so the reference
+  # script's `done < <(curl | jq | aggregate)` can hand you an empty allowlist
+  # and no error at all.
+  GH_CIDRS="$(github_cidrs '(.web + .api + .git)[]')"
+  GH_SSH_CIDRS="$(github_cidrs '.git[]')"
+  [ -n "$GH_CIDRS" ]     || die "GitHub returned no usable IPv4 ranges"
+  [ -n "$GH_SSH_CIDRS" ] || die "GitHub returned no usable IPv4 git ranges"
+  log "GitHub ranges: $(printf '%s\n' "$GH_CIDRS" | wc -l | tr -d ' ') general, $(printf '%s\n' "$GH_SSH_CIDRS" | wc -l | tr -d ' ') for SSH"
+}
+
+apply() {
+  preflight
+  probe_ipset_match \
+    || die "this kernel cannot match ipsets from iptables (ip_set/xt_set unavailable)"
+
+  DOMAINS="$(build_domain_list)"
+  [ -n "$DOMAINS" ] || die "the allowlist is empty"
+  log "effective allowlist ($(printf '%s\n' "$DOMAINS" | wc -l | tr -d ' ') hosts):"
+  printf '%s\n' "$DOMAINS" | while IFS= read -r d; do log "  - $d"; done
+  log "allowed ports (tcp): $ALLOWED_PORTS   local access: $LOCAL_ACCESS"
+
+  # Everything that needs the network happens here, before any rule exists.
+  NAMESERVERS=""
+  NEEDS_EMBEDDED_DNS=0
+  collect_nameservers
+  collect_local_nets
+  fetch_github_meta
+
+  # Flush before touching the ipsets — see the note in populate_sets.
+  ipt -F
+  ipt -X
+  populate_sets
+  apply_ipv4
+  apply_ipv6
+  self_test
+  log "firewall active"
+}
+
+# Re-resolve the same list on a loop and add whatever is new. Additive only: it
+# never destroys a set and never reads a source it wasn't given at boot, so it
+# cannot widen egress beyond the allowlist that was logged at startup. It exists
+# because Cloudflare-fronted hosts (api.anthropic.com, claude.ai, www.figma.com)
+# rotate addresses, and a boot-time-only snapshot starts failing mid-session.
+#
+# Tolerant, not fail-closed: a transient DNS blip must not tear down a working
+# firewall. The rules stay exactly as they were.
+refresh_loop() {
+  LOG_STDERR=0
+  case "$REFRESH_SECONDS" in
+    ''|*[!0-9]*) exit 0 ;;
+  esac
+  [ "$REFRESH_SECONDS" -gt 0 ] || exit 0
+
+  DOMAINS="$(build_domain_list)" || exit 0
+  log "refresher started (every ${REFRESH_SECONDS}s)"
+
+  local d ip ips new
+  local IFS                                # localised: restored on return
+  while sleep "$REFRESH_SECONDS"; do
+    new=0
+    IFS=$'\n'
+    for d in $DOMAINS; do
+      ips="$(resolve_a "$d")" || continue
+      for ip in $ips; do
+        case "$ip" in *[!0-9.]*) continue ;; esac
+        ipset test "$SET_ALLOW" "$ip" >/dev/null 2>&1 && continue
+        ipset -exist add "$SET_ALLOW" "$ip" 2>/dev/null && {
+          log "refresh: + $ip ($d)"
+          new=$((new + 1))
+        }
+      done
+    done
+    IFS=$' \t\n'
+
+    if GH_META="$(curl -fsS --max-time 20 https://api.github.com/meta 2>/dev/null)"; then
+      for ip in $(github_cidrs '(.web + .api + .git)[]' 2>/dev/null || true); do
+        ipset test "$SET_ALLOW" "$ip" >/dev/null 2>&1 && continue
+        ipset -exist add "$SET_ALLOW" "$ip" 2>/dev/null && new=$((new + 1))
+      done
+      for ip in $(github_cidrs '.git[]' 2>/dev/null || true); do
+        ipset -exist add "$SET_SSH" "$ip" 2>/dev/null || true
+      done
+    fi
+    [ "$new" -eq 0 ] || log "refresh: added $new address(es)"
+  done
+}
+
+case "${1:-}" in
+  --refresh) refresh_loop ;;
+  '')        apply ;;
+  *)         die "unknown argument: $1" ;;
+esac

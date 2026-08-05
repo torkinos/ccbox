@@ -21,6 +21,10 @@
 # Platform access: set CCBOX_NET to your compose network (e.g.
 # "<project>_default") to join it and reach services by name.
 #
+# Egress: unrestricted by default. CCBOX_FIREWALL=on adds a default-deny
+# allowlist, installed as root at container start and then locked in by dropping
+# privileges — see README "Egress firewall".
+#
 set -euo pipefail
 
 IMAGE="${CCBOX_IMAGE:-ccbox:latest}"
@@ -31,6 +35,8 @@ PORTS="${CCBOX_PORTS:-}"     # comma-separated publish specs, e.g. 3000,8080:80
 ENVS="${CCBOX_ENV:-}"        # comma-separated var NAMES to forward, e.g. GH_TOKEN
 SKILLS="${CCBOX_SKILLS:-}"   # comma-separated host dirs of skills to mount read-only
 DIRS="${CCBOX_DIRS:-}"       # comma-separated extra host dirs to mount under /mnt
+FIREWALL="${CCBOX_FIREWALL:-}"            # "on" enables the egress allowlist
+ALLOWLIST="${CCBOX_ALLOWLIST_FILE:-}"     # host file of extra allowed host names
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # PORT: upstream enforces rootless podman here, because rootful podman ignores
@@ -107,6 +113,74 @@ dir_specs() {
   done
 }
 
+# Refuse the combinations where an egress firewall would be wrong or a lie.
+# Runs in the parent shell (from load_flags) rather than inside run_flags, which
+# executes in a process substitution where an assignment to FIREWALL would be
+# lost with the subshell.
+firewall_guards() {
+  [ "$FIREWALL" = on ] || return 0
+
+  case "$NET" in
+    host|container:*)
+      echo "ccbox: CCBOX_FIREWALL=on refuses CCBOX_NET=$NET." >&2
+      echo "  That shares another network namespace, so the firewall would rewrite" >&2
+      echo "  the HOST's iptables rules, not the container's — flushing DOCKER-USER" >&2
+      echo "  and breaking every container on this machine." >&2
+      echo "  Use bridge, or a user-defined network." >&2
+      exit 2 ;;
+    none)
+      echo "ccbox: CCBOX_NET=none has no network to filter; firewall not applied." >&2
+      FIREWALL=""
+      return 0 ;;
+  esac
+
+  [ -n "$ALLOWLIST" ] || return 0
+
+  # In an unquoted assignment the shell tilde-expands only the first path, and
+  # CCBOX_ALLOWLIST_FILE is often written as ~/..., so expand it here (same
+  # reasoning as dir_specs).
+  case "$ALLOWLIST" in
+    "~")   ALLOWLIST="$HOME" ;;
+    "~/"*) ALLOWLIST="$HOME/${ALLOWLIST#\~/}" ;;
+  esac
+  if [ ! -f "$ALLOWLIST" ]; then
+    echo "ccbox: CCBOX_ALLOWLIST_FILE: no such file: $ALLOWLIST" >&2
+    exit 2
+  fi
+  ALLOWLIST="$(cd "$(dirname "$ALLOWLIST")" && pwd -P)/$(basename "$ALLOWLIST")"
+
+  # The workspace is bind-mounted read-write and the agent edits it for a
+  # living. An allowlist in there would let a checked-out project — or the agent
+  # itself — widen its own egress, which is the entire thing this prevents.
+  case "$ALLOWLIST" in
+    "$PWD"/*|"$PWD")
+      echo "ccbox: CCBOX_ALLOWLIST_FILE is inside the workspace ($PWD)." >&2
+      echo "  Anything running in the container can edit files there, so an" >&2
+      echo "  allowlist kept in the workspace can widen its own egress." >&2
+      echo "  Keep it somewhere the container cannot write, e.g. ~/.config/ccbox/." >&2
+      exit 2 ;;
+  esac
+}
+
+# Container-side ports from CCBOX_PORTS, so the firewall can open them inbound.
+# A publish spec is [[ip:]hostPort:]containerPort[/proto], so the container port
+# is always the last colon-separated field. Needed because -P INPUT DROP would
+# otherwise block NEW connections to a published port: the bridge-subnet rule
+# only covers it on Docker Desktop, where the userland proxy re-originates from
+# the gateway.
+inbound_ports() {
+  local spec p out=""
+  local IFS=', '
+  for spec in $PORTS; do
+    [ -n "$spec" ] || continue
+    p="${spec##*:}"
+    p="${p%%/*}"
+    case "$p" in ''|*[!0-9-]*) continue ;; esac
+    out="${out:+$out,}$p"
+  done
+  printf '%s' "$out"
+}
+
 # Shared run flags. Only $PWD crosses the host boundary; the home volume is
 # Docker-managed storage, not a host path.
 #
@@ -124,8 +198,16 @@ run_flags() {
   #
   # On Linux, Docker does NOT remap: files would land owned by uid 1000. If your
   # host uid isn't 1000, set CCBOX_USER="$(id -u):$(id -g)" to run as yourself.
+  #
+  # With the firewall on this is overridden: the entrypoint has to be root to
+  # install iptables rules. It drops straight back to CCBOX_USER (or node) with
+  # setpriv, so the process that actually runs Claude Code is still uid 1000
+  # with no capabilities — CapEff and CapBnd both zero. Emitting only one of the
+  # two --user flags matters: docker takes the last one silently.
   local userflag=()
-  if [ -n "${CCBOX_USER:-}" ]; then
+  if [ "$FIREWALL" = on ]; then
+    userflag=(--user 0:0)
+  elif [ -n "${CCBOX_USER:-}" ]; then
     userflag=(--user "$CCBOX_USER")
   fi
 
@@ -146,6 +228,58 @@ run_flags() {
     -v "$PWD":/workspace"$relabel" \
     -v "$VOLUME":/home/node \
     -w /workspace
+
+  # Egress firewall (CCBOX_FIREWALL=on). NET_ADMIN is for the entrypoint alone;
+  # by the time Claude Code starts, setpriv has dropped it along with the whole
+  # capability bounding set. no-new-privileges closes the other half of that
+  # door: the base image ships eight setuid-root binaries, and a root-owned
+  # setuid exec would otherwise regain everything in CapBnd, NET_ADMIN included.
+  #
+  # Bare `--env NAME` (no =value) makes docker read the value from this shell,
+  # the same trick CCBOX_ENV uses below — it keeps values out of `ps` and shell
+  # history, and it means an unset variable is simply not forwarded.
+  if [ "$FIREWALL" = on ]; then
+    printf '%s\n' \
+      --cap-add=NET_ADMIN \
+      --security-opt=no-new-privileges \
+      --env CCBOX_FIREWALL \
+      --env "CCBOX_NET_MODE=$NET"
+
+    # printenv, not ${!fvar}: bare `--env NAME` makes docker read the value from
+    # THIS process's environment, so "is it exported here" is exactly the right
+    # question — and it avoids indirect expansion, which this script can't use
+    # freely while it still has to run on macOS's bash 3.2.
+    local fvar
+    for fvar in CCBOX_ALLOWED_DOMAINS CCBOX_ALLOWED_PORTS CCBOX_FIREWALL_LOCAL \
+                CCBOX_FIREWALL_REFRESH CCBOX_DNS; do
+      printenv "$fvar" >/dev/null 2>&1 || continue
+      printf '%s\n%s\n' --env "$fvar"
+    done
+
+    # Pin the resolver as well as allowing it. On a user-defined network
+    # /etc/resolv.conf only ever says 127.0.0.11, and Docker's embedded resolver
+    # forwards upstream from inside the container's own netns — to an address
+    # nothing inside can discover. CCBOX_DNS names it on both sides at once.
+    local dns
+    local IFS=', '
+    for dns in ${CCBOX_DNS:-}; do
+      [ -n "$dns" ] || continue
+      printf '%s\n%s\n' --dns "$dns"
+    done
+    unset IFS
+
+    local inports
+    inports="$(inbound_ports)"
+    [ -z "$inports" ] || printf '%s\n%s\n' --env "CCBOX_FW_INPORTS=$inports"
+
+    # CCBOX_USER still works: it becomes the setpriv target inside, applied
+    # after the rules are up, instead of docker's --user.
+    [ -z "${CCBOX_USER:-}" ] || printf '%s\n%s\n' --env "CCBOX_RUN_AS=$CCBOX_USER"
+
+    # Read-only, and outside every path the container can write to.
+    [ -z "$ALLOWLIST" ] || \
+      printf '%s\n%s\n' -v "$ALLOWLIST:/etc/ccbox/allowed-domains:ro"
+  fi
 
   # Forward CCBOX_ENV: comma-separated variable NAMES, not name=value pairs.
   # `docker run -e GH_TOKEN` (bare name) makes Docker read the value from this
@@ -230,6 +364,7 @@ load_add_dirs() {
 # `mapfile -t FLAGS < <(run_flags)`: macOS ships bash 3.2, which predates the
 # mapfile/readarray builtin, so that fails with "mapfile: command not found".
 load_flags() {
+  firewall_guards
   FLAGS=()
   while IFS= read -r line; do
     FLAGS+=("$line")
@@ -269,6 +404,20 @@ Environment:
                 working directory. Append :ro for read-only.
                 (e.g. CCBOX_DIRS=~/work/api,~/work/shared:ro ccbox)
   CCBOX_USER    Run as uid:gid      (Linux only; see README)
+
+Egress firewall (opt-in, off by default):
+  CCBOX_FIREWALL          Set to "on" for a default-deny egress allowlist.
+                          Applied as root at container start, then privileges
+                          are dropped — nothing inside can turn it off.
+  CCBOX_ALLOWED_DOMAINS   Extra host names to allow, comma-separated.
+  CCBOX_ALLOWLIST_FILE    Host file of extra host names, one per line.
+                          Must NOT live in the directory you launch from.
+  CCBOX_ALLOWED_PORTS     TCP ports allowed to allowed hosts (default 80,443).
+  CCBOX_FIREWALL_LOCAL    subnet (default) | gateway | off — how much of the
+                          container's own Docker network stays reachable.
+  CCBOX_FIREWALL_REFRESH  Re-resolve interval in seconds (default 1800, 0 off).
+  CCBOX_DNS               Upstream resolver(s) to pin. Needed only if a
+                          user-defined CCBOX_NET can't reach DNS otherwise.
 
 The current directory is bind-mounted at /workspace; nothing else from the
 host is mounted unless you ask for it via CCBOX_DIRS or CCBOX_SKILLS.
@@ -376,13 +525,19 @@ cmd_shell() {
 # reached — bare `ccbox` silently exits 1. Matching "" against *) instead means
 # no-args falls through to cmd_run with an empty "$@", and every branch that
 # shifts is guaranteed at least one positional. (Upstream has this bug.)
-case "${1:-}" in
-  build)            shift; cmd_build "$@" ;;
-  update)           shift; cmd_update "$@" ;;
-  auth)             shift; cmd_auth "$@" ;;
-  auto)             shift; cmd_auto "$@" ;;
-  shell)            shift; cmd_shell "$@" ;;
-  run)              shift; cmd_run "$@" ;;
-  help|-h|--help)   cmd_help ;;
-  *)                cmd_run "$@" ;;   # no args, or unknown args → claude
-esac
+#
+# Guarded so the file can be sourced for its functions without dispatching —
+# test/firewall-test.sh does exactly that, so it asserts against the real
+# run_flags output rather than a copy of it that could drift.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    build)            shift; cmd_build "$@" ;;
+    update)           shift; cmd_update "$@" ;;
+    auth)             shift; cmd_auth "$@" ;;
+    auto)             shift; cmd_auto "$@" ;;
+    shell)            shift; cmd_shell "$@" ;;
+    run)              shift; cmd_run "$@" ;;
+    help|-h|--help)   cmd_help ;;
+    *)                cmd_run "$@" ;;   # no args, or unknown args → claude
+  esac
+fi

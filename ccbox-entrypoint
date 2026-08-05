@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# ccbox-entrypoint — apply the egress firewall as root, then drop to the
+# unprivileged runtime user and exec the real command.
+#
+# With CCBOX_FIREWALL unset this is a single `exec "$@"`: the launcher adds no
+# extra docker flags, the image's `USER node` still applies, so the entrypoint
+# is not root and there is nothing to do. Behaviour is unchanged from before the
+# firewall existed.
+#
+# All diagnostics go to STDERR. `ccbox update` captures the container's stdout
+# to read a version number out of it (cmd_update in the launcher), so anything
+# printed on stdout here would be spliced into that string.
+
+set -euo pipefail
+
+FIREWALL="${CCBOX_FIREWALL:-}"
+
+# ---------------------------------------------------------------------------
+# Not root: nothing to apply and no way to apply it.
+#
+# This is the normal path when the firewall is off, and it is also what makes
+# `ccbox update` work — that command runs `docker run --rm "$IMAGE" npm view`
+# with none of the run flags, so it comes up as uid 1000.
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+  if [ "$FIREWALL" = on ]; then
+    # Asked for a firewall and physically cannot deliver one. Booting anyway
+    # would hand back a container that looks protected and is not.
+    echo "ccbox-entrypoint: CCBOX_FIREWALL=on but the entrypoint is not root." >&2
+    echo "  The container needs --user 0:0 --cap-add=NET_ADMIN." >&2
+    exit 1
+  fi
+  exec "$@"
+fi
+
+if [ "$FIREWALL" = on ]; then
+  # set -e: if the firewall cannot be applied in full, the container dies here
+  # rather than starting Claude Code with open egress.
+  /usr/local/bin/ccbox-init-firewall
+
+  refresh="${CCBOX_FIREWALL_REFRESH:-1800}"
+  case "$refresh" in ''|*[!0-9]*) refresh=1800 ;; esac
+  if [ "$refresh" -gt 0 ]; then
+    # Detached from the terminal's process group so a Ctrl-C in Claude Code
+    # doesn't take it down, and silenced so it can never write into the TUI —
+    # it logs to /var/log/ccbox-firewall.log.
+    setsid /usr/local/bin/ccbox-init-firewall --refresh >/dev/null 2>&1 &
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Drop privileges.
+#
+# setpriv rather than gosu/su-exec: it is already in the base image (util-linux)
+# and it is the only one of the three that can empty the capability BOUNDING
+# set. That matters here — --cap-add=NET_ADMIN otherwise stays in CapBnd for the
+# whole process tree, and the image ships eight setuid-root binaries (su, mount,
+# passwd, ...) through which a root-owned setuid exec would regain the entire
+# bounding set, NET_ADMIN included. --security-opt=no-new-privileges (set by the
+# launcher) stops that too; both together mean there is nothing to regain and no
+# way to regain it.
+# ---------------------------------------------------------------------------
+runas="${CCBOX_RUN_AS:-node}"
+uid="${runas%%:*}"
+case "$runas" in
+  *:*) gid="${runas#*:}" ;;
+  *)   gid="" ;;
+esac
+
+# Resolve to a name where we can, so $USER reads sensibly and --init-groups has
+# a passwd entry to work from. An arbitrary host uid (CCBOX_USER on Linux) has
+# neither, and initgroups would fail outright.
+if uname_="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)" && [ -n "$uname_" ]; then
+  groupflag=--init-groups
+  [ -n "$gid" ] || gid="$(getent passwd "$uid" | cut -d: -f4)"
+else
+  uname_="$uid"
+  groupflag=--clear-groups
+fi
+[ -n "$gid" ] || gid="$uid"
+
+# Claude Code keeps its OAuth token in $HOME/.claude and gh its PAT in
+# $HOME/.config. Under --user 0:0 Docker hands us HOME=/root, and nothing
+# downstream would correct it — `ccbox auth` would write its SSH key into the
+# ephemeral layer instead of the ccbox-home volume, print the public key, and
+# report success. Set it explicitly.
+export HOME=/home/node USER="$uname_" LOGNAME="$uname_"
+
+# runc chowns the pty to the container's *initial* user, which under --user 0:0
+# is root:tty. Inherited fds keep working, but anything that reopens /dev/tty —
+# ssh-keygen's passphrase prompt, git's credential prompt, pinentry-tty — gets
+# EACCES after the drop. Hand the terminal back.
+for fd in 0 1 2; do
+  ttypath="$(readlink "/proc/self/fd/$fd" 2>/dev/null || true)"
+  case "$ttypath" in
+    /dev/pts/*|/dev/console|/dev/tty*) chown "$uid:tty" "$ttypath" 2>/dev/null || true ;;
+  esac
+done
+
+# "$@" verbatim, never `sh -c "$*"`: the latter would re-split the launcher's
+# arguments and turn `ccbox "fix the tests"` into four of them.
+exec setpriv --reuid "$uid" --regid "$gid" "$groupflag" \
+             --inh-caps=-all --bounding-set=-all --no-new-privs -- "$@"

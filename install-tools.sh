@@ -105,6 +105,29 @@ install_gh() {
 }
 
 # ----------------------------------------------------------------------------
+# Egress firewall tooling, used only by ccbox-init-firewall in the entrypoint:
+# iptables/ip6tables to filter, ipset for the allowlist, dig to resolve it,
+# aggregate to collapse GitHub's CIDR list, ip to read the container's own
+# subnet. The `node` user has no capabilities, so none of it is usable from
+# inside the sandbox — installing them costs nothing but disk.
+#
+# jq, curl and ca-certificates come from install_base, and setpriv (the
+# privilege drop) is already in the base image's util-linux, so none are listed.
+#
+# Called LAST: install_git ends with `apt-get autoremove -y --purge`, and
+# ordering after it keeps these packages clear of that sweep.
+# ----------------------------------------------------------------------------
+install_firewall() {
+  apt_update_once
+  apt-get install -y --no-install-recommends \
+    iptables \
+    ipset \
+    dnsutils \
+    aggregate \
+    iproute2
+}
+
+# ----------------------------------------------------------------------------
 # gcloud — Google Cloud CLI (official apt repo, signed).
 # PORT: upstream enables this. Left available but NOT called below — it adds
 # ~1 GB and isn't used in this project. Add `install_gcloud` to the list to
@@ -127,6 +150,7 @@ install_gcloud() {
 install_base
 install_git
 install_gh
+install_firewall
 
 # Cleanup to keep the image small.
 apt-get clean
