@@ -1,0 +1,14 @@
+plugin:  safety-net
+source:  https://github.com/kenryu42/cc-safety-net.git
+tag:     v1.0.6
+commit:  e34ae44a1f341e73729f1be7a62acef27115b109
+version: 1.0.6
+
+Vendored by tools/vendor-safety-net.sh. Only the runtime file set is kept:
+  .claude-plugin/plugin.json
+  hooks/hooks.json
+  dist/bin/cc-safety-net.js
+  skills/cc-safety-net/SKILL.md
+  LICENSE
+
+Run 'tools/vendor-safety-net.sh --verify' to prove these files match the commit.

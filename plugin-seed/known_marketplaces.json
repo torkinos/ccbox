@@ -1,0 +1,10 @@
+{
+  "cc-marketplace": {
+    "source": {
+      "source": "directory",
+      "path": "/opt/claude-code/plugin-seed/marketplaces/cc-marketplace"
+    },
+    "installLocation": "/opt/claude-code/plugin-seed/marketplaces/cc-marketplace",
+    "lastUpdated": "2000-01-01T00:00:00.000Z"
+  }
+}

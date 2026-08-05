@@ -20,6 +20,25 @@ ENV TZ=${TZ}
 COPY install-tools.sh /tmp/install-tools.sh
 RUN chmod +x /tmp/install-tools.sh && /tmp/install-tools.sh && rm /tmp/install-tools.sh
 
+# --- vendored, version-pinned plugin seed ---------------------------------
+# The CC Safety Net PreToolUse hook, baked into the image instead of installed
+# per-project into ~/.claude/plugins. That directory lives on the home volume,
+# so a per-project install is invisible to every other project and to every
+# fresh volume — the same reason skills can't be baked (see README "What
+# doesn't work"). CLAUDE_CODE_PLUGIN_SEED_DIR is Claude Code's supported way
+# out: a read-only seed it reads at startup, from a path no volume shadows.
+# /opt is image storage and root-owned, so the `node` user cannot rewrite the
+# hook that constrains it — the same argument as /etc/claude-code below.
+#
+# Pinned by COMMIT, not by tag: v1.0.6 is a lightweight tag and tags can be
+# moved. plugin-seed/PROVENANCE records the commit; regenerate the tree with
+# tools/vendor-safety-net.sh and prove it still matches with its --verify mode.
+#
+# Deliberately ABOVE the CC_VERSION layer so `ccbox update` never rebuilds it.
+COPY plugin-seed /opt/claude-code/plugin-seed
+RUN chmod -R a-w,a+rX /opt/claude-code/plugin-seed
+ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-code/plugin-seed
+
 # --- Claude Code ----------------------------------------------------------
 # Deliberately the last expensive step, and keyed on CC_VERSION so `ccbox
 # update` rebuilds this layer alone — everything above it, including git built
@@ -30,6 +49,11 @@ RUN chmod +x /tmp/install-tools.sh && /tmp/install-tools.sh && rm /tmp/install-t
 # That is intentional — the image is the version pin. Use `./ccbox update`.
 ARG CC_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CC_VERSION}
+
+# Fail the build if the seeded marketplace doesn't parse against THIS Claude
+# Code version. Offline, needs no login, sub-second. It sits below the CC layer
+# on purpose: it checks the pair, so a version bump re-runs it.
+RUN claude plugin validate /opt/claude-code/plugin-seed/marketplaces/cc-marketplace
 
 # Managed (policy) settings live at /etc/claude-code, OUTSIDE the home volume,
 # so they survive the mount and apply to every run including a fresh volume.
@@ -57,6 +81,17 @@ RUN chmod 0755 /usr/local/bin/ccbox-entrypoint /usr/local/bin/ccbox-init-firewal
 # entrypoint immediately drops back to uid 1000 with setpriv — CapEff and CapBnd
 # both zero. With the firewall off nothing is overridden, the entrypoint sees it
 # is not root, and execs straight through.
+#
+# Registering the plugin seed writes ~/.claude/plugins/known_marketplaces.json
+# at startup, so ~/.claude has to be writable by uid 1000. Docker creates a
+# missing bind-mount target as root:root, and CCBOX_SKILLS mounts land at
+# ~/.claude/skills/<name> — on an EMPTY volume that would otherwise leave
+# ~/.claude itself root-owned and the seed silently unregistered. Image content
+# under /home/node only applies when the volume is empty, which is exactly the
+# case this covers; established volumes keep what they already have.
+RUN mkdir -p /home/node/.claude/skills /home/node/.claude/plugins \
+ && chown -R node:node /home/node/.claude
+
 USER node
 
 WORKDIR /workspace

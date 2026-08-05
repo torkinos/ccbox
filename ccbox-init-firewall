@@ -67,10 +67,14 @@ DEFAULT_DOMAINS="
   statsig.com
   sentry.io
   claude.ai                 # MCP connectors that route through claude.ai
+  downloads.claude.ai       # official plugin marketplace; falls back to a
+                            # github.com clone if unreachable
 
   # GitHub. The CIDRs from api.github.com/meta are added separately and are
   # what actually carries git traffic; these cover the host names directly.
-  github.com                # also the Claude Code plugin marketplace
+  github.com                # also the fallback for the official plugin
+                            # marketplace. The safety-net plugin is vendored
+                            # into the image, so it needs no network at all.
   api.github.com
   codeload.github.com
   raw.githubusercontent.com

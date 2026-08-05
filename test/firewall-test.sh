@@ -192,6 +192,18 @@ BATCH='
   echo
   echo "LOGLINES=$(grep -c . /var/log/ccbox-firewall.log 2>/dev/null || echo 0)"
   grep -q "api.anthropic.com" /var/log/ccbox-firewall.log && echo "AUDIT=T" || echo "AUDIT=F"
+
+  # Image-level policy: the agent must be able to read what confines it and
+  # unable to rewrite it. Same argument as CapBnd above — if uid 1000 can edit
+  # the managed settings or the vendored hook, neither is a control.
+  seed=/opt/claude-code/plugin-seed
+  ms=/etc/claude-code/managed-settings.json
+  [ -r "$ms" ]                                    && msr=T   || msr=F
+  ( : >>"$ms" ) 2>/dev/null                       && msw=T   || msw=F
+  ( : >>"$seed/known_marketplaces.json" ) 2>/dev/null && sdw=T || sdw=F
+  ( touch "$seed/marketplaces/x" ) 2>/dev/null    && sdn=T   || sdn=F
+  echo "MSREAD=$msr MSWRITE=$msw SEEDWRITE=$sdw SEEDNEW=$sdn"
+  echo "SEEDVER=$(node "$seed/marketplaces/cc-marketplace/safety-net/dist/bin/cc-safety-net.js" --version 2>/dev/null)"
 '
 
 note "booting the firewall (this takes a few seconds)"
@@ -231,6 +243,14 @@ else
   check "NoNewPrivs=1"            "NoNewPrivs is set (setuid binaries are inert)"
 
   check "AUDIT=T"     "the effective allowlist is logged and readable"
+
+  # Image-level policy survives the home volume and outranks everything in it.
+  check "MSREAD=T"    "managed settings are readable"
+  check "MSWRITE=F"   "managed settings are not writable by node"
+  check "SEEDWRITE=F" "the vendored plugin seed is not writable by node"
+  check "SEEDNEW=F"   "no new files can be dropped into the plugin seed"
+  check "SEEDVER=$(awk '$1=="version:" {print $2}' "$HERE/plugin-seed/PROVENANCE")" \
+                      "the seeded plugin is the pinned version"
 fi
 
 # The startup log has to reach the operator, not just the log file.
