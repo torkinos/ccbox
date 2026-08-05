@@ -257,6 +257,12 @@ image when that volume is **empty**. An existing volume silently keeps the old
 contents, so image-baked skills appear on fresh volumes and never update on
 established ones.
 
+Plugins have a supported way around this that skills don't:
+`CLAUDE_CODE_PLUGIN_SEED_DIR` points Claude Code at a read-only directory
+*outside* `$HOME`, which it reads at startup on every run regardless of volume
+state. That is how the safety-net hook is shipped — see
+[Vendored plugins](#vendored-plugins).
+
 ## Reading Figma designs
 
 Yes — and the good route needs no credentials inside the container at all.
@@ -578,6 +584,9 @@ Checked on this machine against the built image:
 | `git` on the mounted repo | works, no "dubious ownership" error |
 | Credentials survive container exit | yes, in the volume |
 | Credentials survive without the volume | no — fresh home, as intended |
+| Agent can read the container's own credential files | no, via the Read/Edit tools — see [Managed settings](#managed-settings) for what that does and doesn't reach |
+| Agent can disable the safety-net hook | no — force-enabled in managed settings, and the plugin itself is root-owned in `/opt` |
+| Plugin version drifts on rebuild | no — pinned to a commit, and the build fails if the tag moved |
 
 The only host path that crosses the boundary by default is `$PWD` — plus
 whatever you name in `CCBOX_DIRS` and `CCBOX_SKILLS`, which mount nothing unless
@@ -599,6 +608,8 @@ entry can be made read-only with a `:ro` suffix.
 | Atlassian MCP auto-registered | removed | Third-party endpoint not part of this project |
 | `gcloud` installed | function kept, not called | Adds ~1 GB and unused here. Add `install_gcloud` to the call list in `install-tools.sh` to enable |
 | no egress control | opt-in `CCBOX_FIREWALL=on` | New here, not upstream. Adapted from Anthropic's devcontainer `init-firewall.sh`, with the fixes listed in [Egress firewall](#egress-firewall) |
+| no permission policy | deny rules in managed settings | New here. Credential paths and settings files, applied to every project — see [Managed settings](#managed-settings) |
+| no plugins | safety-net vendored at a pinned commit | New here. Was a per-project install on one volume; now image-level — see [Vendored plugins](#vendored-plugins) |
 
 Kept deliberately: the git-from-source build, the SELinux `:z` logic (correct on
 Docker too, and already skipped on macOS), and the bash 3.2 `load_flags`
@@ -618,8 +629,136 @@ reads it at the highest precedence in the settings hierarchy — **nothing in
 `~/.claude` or a project's `.claude/settings.json` can override it.**
 
 That makes it the right place to pin policy that a project (or a third-party
-skill bundle that edits settings on install) must not be able to loosen. It
-currently sets only `respondToBashCommands: false`, inherited from upstream.
+skill bundle that edits settings on install) must not be able to loosen. It is
+also the only place that survives the home volume, which matters because
+`/home/node` is a **per-project** volume: hardening applied by hand inside one
+container does not follow you to the next repo.
+
+It sets four things.
+
+**Deny rules** on credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`,
+`~/.docker/config.json`, `~/.config/gh/hosts.yml`, Claude Code's own
+`.credentials.json`), on `.env` files anywhere under `/workspace`, on
+`gh auth token`, and on the settings files the agent could otherwise use to
+widen its own permissions. Each credential path is denied for `Read` *and*
+`Edit` — a `Read` deny blocks the Edit tool but not Write or NotebookEdit, so
+without the `Edit` half the agent could still write into `~/.ssh`.
+
+> **What deny rules actually reach.** They cover Claude Code's own file tools
+> (Read, Edit, Write, NotebookEdit), make matches invisible to Grep and Glob,
+> and block Bash output redirection into a denied path. They are **not**
+> OS-enforced: a Python or Node script that opens the file itself still reads
+> it, and Bash file commands are on the edge — the docs describe `cat`, `head`,
+> `tail` and `sed` as covered, but hard enforcement for those runs through
+> Claude Code's OS sandbox, which needs bubblewrap that this image does not
+> install. Treat the rules as removing the easy paths and the accidents, not as
+> a boundary. **The egress firewall is what closes the exfiltration path**, and
+> the container boundary is what closes the rest.
+
+**`allowManagedHooksOnly: true`**, so a checked-out repo cannot run arbitrary
+code through a `.claude/settings.json` hook. Only managed hooks and hooks from
+plugins force-enabled here are loaded. Skills are unaffected — that is a
+different setting, see below.
+
+**`disableSideloadFlags: true`**, which rejects `--plugin-dir`, `--plugin-url`,
+`--agents` and `--mcp-config`. Without it the agent can shell out to
+`claude -p --mcp-config …` and get back the code execution the previous setting
+just took away. `--add-dir` is not affected, so `CCBOX_DIRS` still works.
+
+**`enabledPlugins`**, which force-enables the vendored safety-net plugin so it
+cannot be turned off per project.
+
+Three settings are deliberately **not** set, each because it would break
+something this image relies on:
+
+| Not set | Would break |
+|---|---|
+| `strictPluginOnlyCustomization` | Blocks skills from user sources — kills every `CCBOX_SKILLS` mount |
+| `allowManagedPermissionRulesOnly` | Voids your own `allow` rules, so prompt volume jumps |
+| `strictKnownMarketplaces` | An empty array is total lockdown; a non-empty allowlist also blocks the skills-dir scan unless you re-add it explicitly |
+
+One collision worth knowing about: `Edit(~/.claude/settings.json)` also blocks
+the `update-config` skill, which exists to edit that file. That is the intended
+trade — the agent should not be able to widen its own permissions — but it fails
+visibly rather than gracefully. Drop that one line if you'd rather keep the
+skill working; the two `/workspace/.claude/...` rules are the ones that matter
+against a hostile repo.
+
+## Vendored plugins
+
+The [CC Safety Net](https://github.com/kenryu42/cc-safety-net) PreToolUse hook
+ships in the image. It intercepts every Bash tool call and blocks destructive
+git and filesystem commands before they run — `find -delete`,
+`git reset --hard`, and so on.
+
+Installing it the normal way (`/plugin marketplace add kenryu42/cc-marketplace`)
+has two problems here. It lands in `~/.claude/plugins` on the home volume, so it
+protects one project and no others. And the upstream marketplace manifest
+sources the plugin unpinned:
+
+```json
+{ "source": "url", "url": "https://github.com/kenryu42/cc-safety-net.git" }
+```
+
+No `ref`, no `sha` — so it clones default-branch HEAD while reporting whatever
+version the manifest claims. A container installed this way reported version
+`1.0.6` with the bytes of an unreleased commit.
+
+So the plugin is vendored instead, under `plugin-seed/`:
+
+```
+plugin-seed/
+├── known_marketplaces.json                       # registers the marketplace
+├── PROVENANCE                                    # tag, commit, file set
+└── marketplaces/cc-marketplace/
+    ├── .claude-plugin/marketplace.json           # local mirror of the manifest
+    └── safety-net/                               # upstream, pruned to what runs
+```
+
+That tree is copied to `/opt/claude-code/plugin-seed` and named by
+`CLAUDE_CODE_PLUGIN_SEED_DIR`. Claude Code reads a seed directory at startup on
+every run, so it is immune to the volume-shadowing problem, and it gets three
+properties for free: **auto-update is forced off** for seed marketplaces,
+`/plugin marketplace remove|update` **fails** against them, and the seed itself
+is **never written to** — which is why it can live root-owned and read-only in
+`/opt` where the `node` user cannot touch it.
+
+Only the runtime file set is vendored: `dist/bin/cc-safety-net.js` is a
+self-contained bundle importing nothing but `node:` builtins, so the other
+entry points, the type declarations, `src/`, `tests/` and a screenshot are all
+dropped. 380 KB instead of 2.2 MB.
+
+### Bumping the pin
+
+```bash
+./tools/vendor-safety-net.sh v1.0.7 <commit-sha>   # re-vendor
+./tools/vendor-safety-net.sh --verify              # prove it matches
+./ccbox build
+```
+
+Review the upstream `src/` diff between tags on GitHub first — diffing a
+minified bundle tells you nothing. The script clones the tag, **fails if the tag
+resolves to a different commit than the SHA you passed**, copies the runtime
+file set, and smoke-tests that the bundle still runs and still blocks a
+destructive command. `--verify` re-fetches the recorded commit and compares
+byte-for-byte, failing on both modified and extra files — that is what makes
+"the code I reviewed is the code I shipped" checkable later.
+
+### Migrating an existing volume
+
+Volumes that already have the per-project install keep a stale, unpinned copy.
+The seed takes precedence so the stale copy is not loaded, but it stays on disk
+and will confuse you. Once per volume:
+
+```bash
+ccbox shell -c 'rm -rf ~/.claude/plugins/marketplaces/cc-marketplace \
+                      ~/.claude/plugins/cache/cc-marketplace'
+```
+
+Don't run `/plugin install safety-net@cc-marketplace` afterwards. It resolves
+from the seed, so the bytes are right, but it *copies* them into
+`~/.claude/plugins/cache` on the volume — where the agent can edit them.
+Leaving it to `enabledPlugins` uses the read-only seed in place, with no copy.
 
 ## Caveats
 
@@ -637,6 +776,11 @@ currently sets only `respondToBashCommands: false`, inherited from upstream.
   upstream; worth tightening if you care about that supply-chain link.
 - **Claude Code can't self-update in here** — npm's global dir is root-owned by
   design. Use `ccbox update`.
+- **Deny rules are not OS-enforced.** They gate Claude Code's tools, not the
+  kernel. See the note under [Managed settings](#managed-settings) for exactly
+  what they reach.
+- **The safety-net hook spawns a node process per Bash tool call.** ~350 KB
+  bundle, no dependencies to resolve, but it is not free.
 - **First build compiles git**, so `--no-cache` rebuilds are not instant.
 - **Egress is unrestricted unless you ask.** `CCBOX_FIREWALL` is opt-in, so by
   default anything running in the container can reach anything on the internet —
@@ -663,3 +807,16 @@ Only two mounts, no socket exposure, no `--privileged`. The generated SSH key
 never leaves the volume — only the `.pub` is ever printed.
 
 That review covers a point in time, not future commits.
+
+### Vendored third-party code
+
+One dependency is now committed into this repo rather than fetched: the
+safety-net plugin under `plugin-seed/`. It is a separate project by a separate
+author (MIT, `LICENSE` included), and `dist/bin/cc-safety-net.js` is a 350 KB
+pre-built bundle — so unlike the rest of this repo, it is **not** something you
+can review by reading it here.
+
+What you get instead: `plugin-seed/PROVENANCE` names the exact upstream commit,
+and `tools/vendor-safety-net.sh --verify` proves the committed bytes are that
+commit's bytes and nothing else. Review the upstream `src/` at that tag on
+GitHub; the script is what ties your review to what actually ships.

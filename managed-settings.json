@@ -1,3 +1,51 @@
 {
-  "respondToBashCommands": false
+  "respondToBashCommands": false,
+
+  "allowManagedHooksOnly": true,
+  "disableSideloadFlags": true,
+
+  "enabledPlugins": {
+    "safety-net@cc-marketplace": true
+  },
+
+  "env": {
+    "CLAUDE_CODE_PLUGIN_SEED_DIR": "/opt/claude-code/plugin-seed"
+  },
+
+  "permissions": {
+    "deny": [
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.claude.json)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.netrc)",
+      "Read(~/.docker/config.json)",
+      "Read(//workspace/.env)",
+      "Read(//workspace/**/.env)",
+
+      "Edit(~/.config/gh/hosts.yml)",
+      "Edit(~/.claude/.credentials.json)",
+      "Edit(~/.claude.json)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/.aws/**)",
+      "Edit(~/.gnupg/**)",
+      "Edit(~/.netrc)",
+      "Edit(~/.docker/config.json)",
+
+      "Bash(gh auth token*)",
+      "Bash(gh auth status --show-token*)",
+
+      "Edit(~/.claude/settings.json)",
+      "Edit(//workspace/.claude/settings.json)",
+      "Edit(//workspace/.claude/settings.local.json)",
+      "Edit(//etc/claude-code/**)",
+
+      "Edit(~/.claude/plugins/**)",
+      "Edit(//workspace/**/.cc-safety-net/**)",
+      "Edit(//workspace/**/.safety-net.json)",
+      "Edit(~/.cc-safety-net/**)"
+    ]
+  }
 }
