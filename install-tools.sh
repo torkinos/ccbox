@@ -128,6 +128,44 @@ install_firewall() {
 }
 
 # ----------------------------------------------------------------------------
+# Socket Firewall — npm supply-chain filtering, used only when the launcher
+# passes CCBOX_SOCKET=on. `sfw` proxies a package manager's fetches and asks
+# Socket about each package before it lands, which catches malicious versions
+# ahead of the registry's own takedowns.
+#
+# The FREE build: no Socket seat, no API token, same filtering. Enterprise
+# (org policy, reporting, shared cache) lives in SocketDev/firewall-release
+# with the asset prefix `sfw-` instead of `sfw-free-`, and wants
+# SOCKET_API_TOKEN at run time — pass it with CCBOX_ENV, never bake it in.
+#
+# Version-pinned rather than :latest for the same reason the plugin seed is
+# pinned to a commit: an image should not change what it enforces underneath
+# you. The sha256 is echoed the way install_git records its tarball.
+#
+# The shims that put this in front of npm are fanned out in the Dockerfile —
+# they need a COPY, which this file (it runs from /tmp alone) cannot do.
+# ----------------------------------------------------------------------------
+install_socket_firewall() {
+  local ver="v1.15.0" arch asset
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    arm64) asset="sfw-free-linux-arm64" ;;
+    amd64) asset="sfw-free-linux-x86_64" ;;
+    *) echo "socket firewall: no published asset for $arch" >&2; return 1 ;;
+  esac
+
+  install -d /usr/local/lib/socket-firewall
+  curl -fsSL -o /usr/local/lib/socket-firewall/sfw \
+    "https://github.com/SocketDev/sfw-free/releases/download/${ver}/${asset}"
+  echo "${asset} ${ver} sha256: $(sha256sum /usr/local/lib/socket-firewall/sfw | cut -d' ' -f1)"
+  chmod 0755 /usr/local/lib/socket-firewall/sfw
+
+  # Smoke test: a truncated download or a wrong-arch asset fails the build here
+  # rather than at the first `npm install` inside somebody's container.
+  /usr/local/lib/socket-firewall/sfw --version
+}
+
+# ----------------------------------------------------------------------------
 # gcloud — Google Cloud CLI (official apt repo, signed).
 # PORT: upstream enables this. Left available but NOT called below — it adds
 # ~1 GB and isn't used in this project. Add `install_gcloud` to the list to
@@ -151,6 +189,7 @@ install_base
 install_git
 install_gh
 install_firewall
+install_socket_firewall
 
 # Cleanup to keep the image small.
 apt-get clean

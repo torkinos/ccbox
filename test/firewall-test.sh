@@ -278,6 +278,74 @@ case "$EXTRA" in
 esac
 
 # =============================================================================
+note "Socket Firewall (CCBOX_SOCKET)"
+# =============================================================================
+#
+# Every case here runs in a subshell with its own env prefix. CCBOX_FIREWALL is
+# left exported as the section above set it, because the authenticated tier
+# below still expects it on.
+
+# Off is off. The assertion that this is genuinely opt-in rather than merely
+# documented as such.
+sock_off="$( (unset CCBOX_FIREWALL; ccbox_sh 'command -v npm') 2>/dev/null )"
+case "$sock_off" in
+  */usr/local/bin/npm) ok  "CCBOX_SOCKET unset: npm is the real npm, PATH untouched" ;;
+  *)                   bad "CCBOX_SOCKET unset: npm is the real npm (got: $sock_off)" ;;
+esac
+
+# A stale image — sfw missing while the flag says filter — must refuse to boot,
+# not run the package manager unfiltered. An empty, non-executable file bind
+# mounted over the binary reproduces that without rebuilding.
+: > "$WORK/not-sfw"
+expect_fail "CCBOX_SOCKET=on without sfw in the image refuses to start" \
+  docker run --rm -e CCBOX_SOCKET=on \
+    -v "$WORK/not-sfw:/usr/local/lib/socket-firewall/sfw:ro" \
+    "$IMAGE" bash -lc 'echo SHOULD-NOT-REACH-HERE'
+
+# On, egress firewall off: the common case.
+sock_on="$( (unset CCBOX_FIREWALL; CCBOX_SOCKET=on ccbox_sh '
+  echo "NPM=$(command -v npm)"
+  echo "FAIL=$SFW_FAIL_ACTION"
+  d=$(mktemp -d) && cd "$d"
+  printf "{\"name\":\"s\",\"version\":\"1.0.0\"}\n" > package.json
+  SFW_VERBOSE=true npm install lodash --no-audit --no-fund 2>&1 \
+    | grep -qi "Protected by Socket Firewall" && echo SCANNED=T || echo SCANNED=F
+  SFW_DISABLE=1 npm --version >/dev/null 2>&1 && echo BYPASS=T || echo BYPASS=F
+') 2>/dev/null )"
+sock_has() { case "$sock_on" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+sock_check() {
+  if sock_has "$1"; then ok "$2"
+  else bad "$2  (got: $(printf '%s' "$sock_on" | tr '\n' ' '))"; fi
+}
+sock_check "NPM=/usr/local/lib/socket-shims/npm" \
+  "CCBOX_SOCKET=on: npm resolves to the shim, so the agent's installs are covered too"
+sock_check "FAIL=block"  "CCBOX_SOCKET=on: SFW_FAIL_ACTION defaults to block (fails closed)"
+sock_check "SCANNED=T"   "CCBOX_SOCKET=on: npm install goes through sfw"
+sock_check "BYPASS=T"    "SFW_DISABLE=1 bypasses the shim"
+
+# Both on. This is the regression guard for a silent failure: without
+# firewall-api.socket.dev on the allowlist its lookups are REJECTed, sfw's own
+# default is to fail OPEN, and npm reports itself protected over packages
+# nobody checked. Drop the CCBOX_SOCKET block in ccbox-init-firewall and this
+# is the test that catches it.
+sock_fw="$( (CCBOX_SOCKET=on CCBOX_FIREWALL=on CCBOX_FIREWALL_REFRESH=0 ccbox_sh '
+  curl -sS --max-time 20 -o /dev/null https://firewall-api.socket.dev/ \
+    && echo SOCKETAPI=T || echo SOCKETAPI=F
+  d=$(mktemp -d) && cd "$d"
+  printf "{\"name\":\"s\",\"version\":\"1.0.0\"}\n" > package.json
+  SFW_VERBOSE=true npm install lodash --no-audit --no-fund 2>&1 \
+    | grep -qi "Protected by Socket Firewall" && echo SCANNED=T || echo SCANNED=F
+') 2>/dev/null )"
+case "$sock_fw" in
+  *SOCKETAPI=T*) ok  "both firewalls on: firewall-api.socket.dev is allowlisted" ;;
+  *)             bad "both firewalls on: firewall-api.socket.dev is allowlisted (got: $sock_fw)" ;;
+esac
+case "$sock_fw" in
+  *SCANNED=T*) ok  "both firewalls on: npm install still resolves through sfw" ;;
+  *)           bad "both firewalls on: npm install still resolves through sfw (got: $sock_fw)" ;;
+esac
+
+# =============================================================================
 note "authenticated tier"
 # =============================================================================
 

@@ -229,6 +229,16 @@ run_flags() {
     -v "$VOLUME":/home/node \
     -w /workspace
 
+  # Socket Firewall (CCBOX_SOCKET=on). Independent of CCBOX_FIREWALL and
+  # forwarded either way — the entrypoint reads it and prepends the shim dir to
+  # PATH. `if printenv`, not `&&`, so an unset variable doesn't trip set -e.
+  #
+  # SFW_FAIL_ACTION and, on an enterprise seat, SOCKET_API_TOKEN need nothing
+  # here: CCBOX_ENV already forwards a variable by name.
+  if printenv CCBOX_SOCKET >/dev/null 2>&1; then
+    printf '%s\n%s\n' --env CCBOX_SOCKET
+  fi
+
   # Egress firewall (CCBOX_FIREWALL=on). NET_ADMIN is for the entrypoint alone;
   # by the time Claude Code starts, setpriv has dropped it along with the whole
   # capability bounding set. no-new-privileges closes the other half of that
@@ -418,6 +428,18 @@ Egress firewall (opt-in, off by default):
   CCBOX_FIREWALL_REFRESH  Re-resolve interval in seconds (default 1800, 0 off).
   CCBOX_DNS               Upstream resolver(s) to pin. Needed only if a
                           user-defined CCBOX_NET can't reach DNS otherwise.
+
+npm supply-chain firewall (opt-in, off by default):
+  CCBOX_SOCKET            Set to "on" to route npm/npx/yarn through Socket
+                          Firewall, which checks each package before it lands.
+                          Applies to what the agent installs, not just what you
+                          type. Independent of CCBOX_FIREWALL; with both on,
+                          socket.dev is allowlisted automatically.
+                          Per-command escape: SFW_DISABLE=1 npm install ...
+  SFW_FAIL_ACTION         block (default here) | allow — what happens when
+                          Socket is unreachable. Forward with CCBOX_ENV.
+  SOCKET_API_TOKEN        Enterprise seats only; the image ships the free
+                          build. Forward with CCBOX_ENV=SOCKET_API_TOKEN.
 
 The current directory is bind-mounted at /workspace; nothing else from the
 host is mounted unless you ask for it via CCBOX_DIRS or CCBOX_SKILLS.

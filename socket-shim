@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# socket-shim — one shim, copied to npm/npx/yarn/... during the image build and
+# put on PATH by ccbox-entrypoint when CCBOX_SOCKET=on. It resolves its own
+# basename, so all the copies are byte-identical.
+#
+# Every package-manager invocation goes through `sfw`, which proxies the fetch
+# and asks Socket about each package before it lands. This covers the agent's
+# own `npm install`, not just what a human types — which an alias cannot do,
+# because Claude Code snapshots the shell with `unalias -a` and
+# `shopt -u expand_aliases` and runs every Bash tool call against that snapshot.
+#
+# Bypass: the absolute path (/usr/local/bin/npm) or SFW_DISABLE=1. Both are
+# deliberate escape hatches, and both are available to the agent too — see
+# README "npm supply-chain firewall" on why this is a supply-chain guard and
+# not a containment boundary.
+
+SHIM_DIR="${SFW_SHIM_DIR:-/usr/local/lib/socket-shims}"
+SFW_BIN="${SFW_BIN:-/usr/local/lib/socket-firewall/sfw}"
+CMD="${0##*/}"
+
+# Resolve the real binary, skipping this shim directory.
+#
+# The absolute path is the point: `sfw` resolves a bare command name through
+# PATH, so handing it "npm" from a shim named "npm" would make it re-enter this
+# script, forever.
+REAL=""
+IFS=: read -ra _dirs <<< "$PATH"
+for d in "${_dirs[@]}"; do
+  [ -z "$d" ] && continue
+  [ "$d" = "$SHIM_DIR" ] && continue
+  if [ -x "$d/$CMD" ] && [ ! -d "$d/$CMD" ]; then REAL="$d/$CMD"; break; fi
+done
+[ -n "$REAL" ] || { echo "socket-shim: $CMD not found outside $SHIM_DIR" >&2; exit 127; }
+
+# Escape hatch, for when the proxy is in the way of something.
+[ -n "${SFW_DISABLE:-}" ] && exec "$REAL" "$@"
+
+# Already inside an sfw session? It exports NODE_EXTRA_CA_CERTS pointing at the
+# CA it generated for this run, so an npm lifecycle script or a nested
+# `npm run` already has the proxy in its environment. A second one would only
+# cost time.
+case "${NODE_EXTRA_CA_CERTS:-}" in
+  */socketFirewallCa.crt) exec "$REAL" "$@" ;;
+esac
+
+# Missing binary with the shims on PATH means a half-built image. Fail loudly
+# rather than silently running the package manager unfiltered.
+[ -x "$SFW_BIN" ] || { echo "socket-shim: $SFW_BIN missing — rebuild with ./ccbox build" >&2; exit 127; }
+
+exec "$SFW_BIN" "$REAL" "$@"
