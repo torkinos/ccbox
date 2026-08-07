@@ -96,6 +96,22 @@ DEFAULT_DOMAINS="
   api.bitfinex.com
 "
 
+# Socket Firewall (CCBOX_SOCKET=on) resolves every package through
+# firewall-api.socket.dev before npm is allowed to see it. Appended rather than
+# baked into the list above so the default allowlist stays minimal for runs that
+# don't use it.
+#
+# This is not a convenience entry. Without it the lookup is REJECTed, and sfw's
+# own default is to fail OPEN — it reports "not blocked" and npm prints
+# "Protected by Socket Firewall" over a package nobody checked. The image sets
+# SFW_FAIL_ACTION=block so that failure is loud; this keeps it from arising.
+if [ "${CCBOX_SOCKET:-}" = on ]; then
+  DEFAULT_DOMAINS="$DEFAULT_DOMAINS
+  firewall-api.socket.dev   # package verdicts and telemetry
+  api.socket.dev            # quota and org lookups on the enterprise build
+"
+fi
+
 # ---------------------------------------------------------------------------
 # Stage 0 — preconditions
 # ---------------------------------------------------------------------------
@@ -456,6 +472,15 @@ self_test() {
     || die "self-test failed: https://api.anthropic.com is NOT reachable"
   curl -s --connect-timeout 10 -o /dev/null https://api.github.com/zen \
     || die "self-test failed: https://api.github.com is NOT reachable"
+
+  # Connectivity only — the host answers 403 to an unauthenticated GET and curl
+  # without -f exits 0 on that, same as the two checks above. Reachability is
+  # the whole question: unreachable means sfw fails open and filters nothing.
+  if [ "${CCBOX_SOCKET:-}" = on ]; then
+    curl -s --connect-timeout 10 -o /dev/null https://firewall-api.socket.dev/ \
+      || die "self-test failed: https://firewall-api.socket.dev is NOT reachable — Socket Firewall would pass every package unchecked"
+  fi
+
   log "self-test passed: allowlist reachable, everything else rejected"
 }
 

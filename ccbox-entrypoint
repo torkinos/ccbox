@@ -15,6 +15,39 @@
 set -euo pipefail
 
 FIREWALL="${CCBOX_FIREWALL:-}"
+SOCKET="${CCBOX_SOCKET:-}"
+
+# ---------------------------------------------------------------------------
+# Socket Firewall (CCBOX_SOCKET=on) — put the package-manager shims in front of
+# the real binaries.
+#
+# Above the not-root branch below, and independent of CCBOX_FIREWALL: this
+# works with the egress firewall off, which is the common case, so it must run
+# before that early `exec "$@"`. The exports survive the setpriv at the end.
+#
+# PATH rather than a shell alias, because the point is to cover what the AGENT
+# installs. Claude Code snapshots the shell at session start with `unalias -a`
+# and `shopt -u expand_aliases` and runs every Bash tool call against that
+# snapshot, so an alias reaches a human at a prompt and nothing else.
+#
+# SFW_FAIL_ACTION=block because sfw's own default is to fail OPEN — on a failed
+# lookup it reports "not blocked" and npm prints "Protected by Socket Firewall"
+# over a package nobody checked. That is the failure mode ccbox-init-firewall
+# exists to avoid, so it does not get to happen here either. Overridable for a
+# genuine Socket outage.
+# ---------------------------------------------------------------------------
+if [ "$SOCKET" = on ]; then
+  # Asked for filtering and physically cannot deliver it — same call as the
+  # firewall makes below. A container that looks protected and is not is worse
+  # than one that plainly isn't.
+  if [ ! -x /usr/local/lib/socket-firewall/sfw ]; then
+    echo "ccbox-entrypoint: CCBOX_SOCKET=on but sfw is not in this image." >&2
+    echo "  Rebuild it: ./ccbox build" >&2
+    exit 1
+  fi
+  export PATH="/usr/local/lib/socket-shims:$PATH"
+  export SFW_FAIL_ACTION="${SFW_FAIL_ACTION:-block}"
+fi
 
 # ---------------------------------------------------------------------------
 # Not root: nothing to apply and no way to apply it.

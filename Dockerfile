@@ -39,6 +39,37 @@ COPY plugin-seed /opt/claude-code/plugin-seed
 RUN chmod -R a-w,a+rX /opt/claude-code/plugin-seed
 ENV CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-code/plugin-seed
 
+# --- Socket Firewall ------------------------------------------------------
+# Opt-in npm supply-chain filtering, off unless the launcher passes
+# CCBOX_SOCKET=on. The binary comes from install-tools.sh; this block fans one
+# shim out over the package managers that actually exist in the image.
+#
+# The `command -v` guard is load-bearing, not tidiness: a pnpm shim with no
+# pnpm behind it makes `command -v pnpm` succeed, and both Expo and the RN CLI
+# probe that way to choose a package manager. node:24-bookworm-slim has npm,
+# npx, yarn and yarnpkg; pnpm and bun it does not.
+#
+# Root-owned and inside the image, never on a volume, so `node` cannot rewrite
+# the thing that filters it — the same argument as the firewall scripts below.
+#
+# PATH is deliberately NOT set here. The entrypoint prepends the shim dir when
+# CCBOX_SOCKET=on, which is what makes this opt-in; setting it as an image ENV
+# would also wrap the build's own `npm install -g` two steps down, which would
+# need socket.dev reachable at build time for no benefit.
+#
+# Deliberately ABOVE the CC_VERSION layer so `ccbox update` never re-downloads
+# the ~130 MB binary — same reason as the plugin seed.
+COPY socket-shim /usr/local/lib/socket-shim
+RUN set -eux; \
+    chmod 0755 /usr/local/lib/socket-shim; \
+    mkdir -p /usr/local/lib/socket-shims; \
+    for c in npm npx yarn yarnpkg pnpm bun; do \
+      command -v "$c" >/dev/null 2>&1 || continue; \
+      cp /usr/local/lib/socket-shim "/usr/local/lib/socket-shims/$c"; \
+      echo "socket-firewall: wrapping $c"; \
+    done; \
+    rm /usr/local/lib/socket-shim
+
 # --- Claude Code ----------------------------------------------------------
 # Deliberately the last expensive step, and keyed on CC_VERSION so `ccbox
 # update` rebuilds this layer alone — everything above it, including git built
