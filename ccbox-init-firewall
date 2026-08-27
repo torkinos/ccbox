@@ -18,7 +18,7 @@
 #
 # Derived from Anthropic's .devcontainer/init-firewall.sh. The deviations —
 # IPv6, scoped SSH, scoped DNS, no sudo, fail-closed, filter-table-only — are
-# documented in README "Egress firewall".
+# documented in docs/firewall.md.
 #
 #   ccbox-init-firewall             apply the rules, verify, exit
 #   ccbox-init-firewall --refresh   re-resolve on a loop (backgrounded by the
@@ -91,9 +91,6 @@ DEFAULT_DOMAINS="
   api.figma.com
   figma-alpha-api.s3.us-west-2.amazonaws.com
   s3-alpha-sig.figma.com
-
-  # Project-specific
-  api.bitfinex.com
 "
 
 # Socket Firewall (CCBOX_SOCKET=on) resolves every package through
@@ -295,9 +292,9 @@ collect_local_nets() {
   esac
 
   # host.docker.internal sits on the Docker Desktop VM network, not the
-  # container's subnet, so it needs its own rule. Figma Route A (README) talks
-  # to the desktop app's MCP server there. Best effort: on native Linux it only
-  # resolves if the launcher was given --add-host.
+  # container's subnet, so it needs its own rule. Figma Route A (docs/figma.md)
+  # talks to the desktop app's MCP server there. Best effort: on native Linux
+  # it only resolves if the launcher was given --add-host.
   if [ "$LOCAL_ACCESS" != off ]; then
     local hdi
     hdi="$(getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1; exit}' || true)"

@@ -12,8 +12,8 @@
 #
 # Bypass: the absolute path (/usr/local/bin/npm) or SFW_DISABLE=1. Both are
 # deliberate escape hatches, and both are available to the agent too — see
-# README "npm supply-chain firewall" on why this is a supply-chain guard and
-# not a containment boundary.
+# docs/socket-firewall.md on why this is a supply-chain guard and not a
+# containment boundary.
 
 SHIM_DIR="${SFW_SHIM_DIR:-/usr/local/lib/socket-shims}"
 SFW_BIN="${SFW_BIN:-/usr/local/lib/socket-firewall/sfw}"

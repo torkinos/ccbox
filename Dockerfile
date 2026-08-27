@@ -1,10 +1,7 @@
 # Claude Code in a Docker container.
 #
-# Docker port of ccbox by Nikoloz Razmadze (MIT licensed):
-#   https://github.com/ralozkolya/ccbox
-# The architecture — single bind mount, credentials in a named volume, tools
-# baked into the image, version-pinned Claude Code layer — is theirs.
-# Deviations from upstream are marked "PORT:".
+# Originally adapted from ralozkolya/ccbox (MIT) — see docs/origins.md.
+# Deviations made during the port are marked "PORT:".
 #
 # Build:  ./ccbox build
 FROM node:24-bookworm-slim
@@ -24,8 +21,8 @@ RUN chmod +x /tmp/install-tools.sh && /tmp/install-tools.sh && rm /tmp/install-t
 # The CC Safety Net PreToolUse hook, baked into the image instead of installed
 # per-project into ~/.claude/plugins. That directory lives on the home volume,
 # so a per-project install is invisible to every other project and to every
-# fresh volume — the same reason skills can't be baked (see README "What
-# doesn't work"). CLAUDE_CODE_PLUGIN_SEED_DIR is Claude Code's supported way
+# fresh volume — the same reason skills can't be baked (see docs/skills.md,
+# "What doesn't work"). CLAUDE_CODE_PLUGIN_SEED_DIR is Claude Code's supported way
 # out: a read-only seed it reads at startup, from a path no volume shadows.
 # /opt is image storage and root-owned, so the `node` user cannot rewrite the
 # hook that constrains it — the same argument as /etc/claude-code below.

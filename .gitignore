@@ -1,0 +1,4 @@
+# Local Claude Code settings (machine-specific paths, permission grants)
+.claude/settings.local.json
+
+.DS_Store

@@ -10,9 +10,8 @@
 #   ccbox shell          Run a bash shell against $PWD.
 #   ccbox help           Show usage.
 #
-# Docker port of ccbox by Nikoloz Razmadze (MIT):
-#   https://github.com/ralozkolya/ccbox
-# Deviations from upstream are marked "PORT:".
+# Originally adapted from ralozkolya/ccbox (MIT) — see docs/origins.md.
+# Deviations made during the port are marked "PORT:".
 #
 # Host boundary: the current directory is the only bind mount you get by
 # default. CCBOX_DIRS and CCBOX_SKILLS add more, explicitly and one at a time.
@@ -23,7 +22,7 @@
 #
 # Egress: unrestricted by default. CCBOX_FIREWALL=on adds a default-deny
 # allowlist, installed as root at container start and then locked in by dropping
-# privileges — see README "Egress firewall".
+# privileges — see docs/firewall.md.
 #
 set -euo pipefail
 
@@ -295,7 +294,7 @@ run_flags() {
   # `docker run -e GH_TOKEN` (bare name) makes Docker read the value from this
   # shell's environment, so the secret never appears on the command line, in
   # your shell history, or in `ps` output. It IS still visible via
-  # `docker inspect` on the running container — see README.
+  # `docker inspect` on the running container — see docs/github-access.md.
   local var
   local IFS=', '
   for var in $ENVS; do

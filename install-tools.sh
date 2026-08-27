@@ -6,7 +6,7 @@
 # at the bottom. Each function runs as root during the image build. Keep them
 # self-contained so they're easy to reason about.
 #
-# Adapted from ccbox by Nikoloz Razmadze (MIT): https://github.com/ralozkolya/ccbox
+# Originally adapted from ralozkolya/ccbox (MIT) — see docs/origins.md.
 #
 set -euo pipefail
 
