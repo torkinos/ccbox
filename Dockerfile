@@ -11,6 +11,11 @@ FROM node:24-bookworm-slim
 ARG TZ=UTC
 ENV TZ=${TZ}
 
+# UTF-8 locale. Without it the container runs in the POSIX locale and TUIs
+# fall back to VT100 line drawing ("qqqq" instead of box lines). C.UTF-8 is
+# built into Debian, so no locale-gen is needed.
+ENV LANG=C.UTF-8
+
 # --- base tools (git, ssh, gh, ...) ---------------------------------------
 # install-tools.sh is the single seam for extending the toolset: add an
 # install_<name> function there and call it in the list at the bottom.
