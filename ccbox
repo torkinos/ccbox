@@ -36,7 +36,16 @@ SKILLS="${CCBOX_SKILLS:-}"   # comma-separated host dirs of skills to mount read
 DIRS="${CCBOX_DIRS:-}"       # comma-separated extra host dirs to mount under /mnt
 FIREWALL="${CCBOX_FIREWALL:-}"            # "on" enables the egress allowlist
 ALLOWLIST="${CCBOX_ALLOWLIST_FILE:-}"     # host file of extra allowed host names
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Follow symlinks (e.g. ~/.local/bin/ccbox -> repo) so HERE is the repo, where
+# the Dockerfile lives. A loop, not `readlink -f`, which older macOS lacks.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+HERE="$(cd "$(dirname "$_src")" && pwd)"
+unset _src _dir
 
 # PORT: upstream enforces rootless podman here, because rootful podman ignores
 # --userns=keep-id and the workspace mount ends up unwritable. Docker has no
