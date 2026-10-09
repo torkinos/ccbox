@@ -80,8 +80,12 @@ RUN set -eux; \
 # Claude Code cannot self-update in here: npm's global dir is root-owned and the
 # container runs as `node`, so its in-app updater fails with "no_permissions".
 # That is intentional — the image is the version pin. Use `./ccbox update`.
+# DISABLE_AUTOUPDATER stops it trying, which silences the "Auto-update failed:
+# no write permission to npm prefix" banner. Set after the install so adding it
+# does not invalidate the cached layers above.
 ARG CC_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CC_VERSION}
+ENV DISABLE_AUTOUPDATER=1
 
 # Fail the build if the seeded marketplace doesn't parse against THIS Claude
 # Code version. Offline, needs no login, sub-second. It sits below the CC layer
