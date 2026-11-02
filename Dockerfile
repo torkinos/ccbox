@@ -11,6 +11,11 @@ FROM node:24-bookworm-slim
 ARG TZ=UTC
 ENV TZ=${TZ}
 
+# UTF-8 locale. Without it the container runs in the POSIX locale and TUIs
+# fall back to VT100 line drawing ("qqqq" instead of box lines). C.UTF-8 is
+# built into Debian, so no locale-gen is needed.
+ENV LANG=C.UTF-8
+
 # --- base tools (git, ssh, gh, ...) ---------------------------------------
 # install-tools.sh is the single seam for extending the toolset: add an
 # install_<name> function there and call it in the list at the bottom.
@@ -75,8 +80,12 @@ RUN set -eux; \
 # Claude Code cannot self-update in here: npm's global dir is root-owned and the
 # container runs as `node`, so its in-app updater fails with "no_permissions".
 # That is intentional — the image is the version pin. Use `./ccbox update`.
+# DISABLE_AUTOUPDATER stops it trying, which silences the "Auto-update failed:
+# no write permission to npm prefix" banner. Set after the install so adding it
+# does not invalidate the cached layers above.
 ARG CC_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CC_VERSION}
+ENV DISABLE_AUTOUPDATER=1
 
 # Fail the build if the seeded marketplace doesn't parse against THIS Claude
 # Code version. Offline, needs no login, sub-second. It sits below the CC layer
