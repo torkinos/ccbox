@@ -30,9 +30,19 @@ CCBOX_IMAGE=ccbox:embedded ccbox          # run with that toolchain
 **Concurrent sessions** — several containers can run at once, including on the
 same volume. Verified: two containers sharing `ccbox-home` both start, and each
 sees the other's writes live. That is the same situation as running `claude` in
-two terminals on your host, and behaves the same way: fine in practice, but two
-sessions are writing one `~/.claude`, so use separate volumes if you want their
-histories and settings genuinely independent.
+two terminals on your host, and behaves the same way. Each project directory is
+mounted at its own `/workspace/<name>-<hash>` path, so different projects keep
+separate histories and memory; settings in `~/.claude` are shared across the
+volume. Use separate volumes if you want those genuinely independent too.
+
+Each session's container is named `ccbox-<name>-<hash>-<pid>` and labelled
+`ccbox=1` and `ccbox.dir=<host path>`:
+
+```bash
+docker ps --filter label=ccbox                          # every ccbox session
+docker ps --filter label=ccbox.dir="$PWD"               # sessions for this directory
+docker stop $(docker ps -q --filter label=ccbox)        # stop them all
+```
 
 Mixing axes works as expected:
 

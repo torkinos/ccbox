@@ -12,8 +12,8 @@ Checked against the built image:
 | Host home (`/Users`, `~`) visible inside? | no |
 | Host `~/.ssh` reachable? | no |
 | Docker socket exposed? | no — no socket mount, no `--privileged` |
-| `--cap-add` used? | none by default. `CCBOX_FIREWALL=on` adds `NET_ADMIN` for the entrypoint only, then drops it |
-| Runs as root? | no — uid 1000 (`node`). With the firewall on the entrypoint is briefly uid 0, then `setpriv` drops to 1000 with `CapEff` and `CapBnd` both zero |
+| `--cap-add` used? | none by default. `CCBOX_FIREWALL=on` adds `NET_ADMIN`; only the root processes keep it (entrypoint, re-resolver, `docker-init`), and it is dropped for everything that runs Claude Code |
+| Runs as root? | no — uid 1000 (`node`). With the firewall on, the entrypoint is briefly uid 0 before `setpriv` drops to 1000 with `CapEff` and `CapBnd` both zero; the re-resolver and `docker-init` (PID 1 from `--init`) stay root, and uid 1000 can't signal or trace them |
 | Outbound network | unrestricted by default; default-deny allowlist with `CCBOX_FIREWALL=on` |
 | Packages the agent installs | unchecked by default; scanned by Socket with `CCBOX_SOCKET=on`. A guard, not a boundary — `node` can still call `/usr/local/bin/npm` directly, and that is not closeable (see [npm supply-chain firewall](socket-firewall.md)) |
 | Files written to the workspace | owned by **you** on the host, not root or 1000 |
@@ -42,10 +42,10 @@ reads it at the highest precedence in the settings hierarchy — **nothing in
 That makes it the right place to pin policy that a project (or a third-party
 skill bundle that edits settings on install) must not be able to loosen. It is
 also the only place that survives the home volume, which matters because
-`/home/node` is a **per-project** volume: hardening applied by hand inside one
-container does not follow you to the next repo.
+hardening applied by hand inside one volume does not follow you to another
+(`CCBOX_VOLUME`), and a fresh volume starts with none of it.
 
-It sets four things.
+It sets five things.
 
 **Deny rules** on credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`,
 `~/.docker/config.json`, `~/.config/gh/hosts.yml`, Claude Code's own
@@ -80,6 +80,13 @@ just took away. `--add-dir` is not affected, so `CCBOX_DIRS` still works.
 cannot be turned off per project — see
 [Vendored safety-net plugin](safety-net.md).
 
+**`statusLine`**, which runs the root-owned `/usr/local/bin/ccbox-statusline`:
+model, context window use, and your claude.ai 5-hour and 7-day usage limits
+with time to reset. It has to be set here: under `allowManagedHooksOnly`,
+Claude Code runs a status line only from managed settings, so one in
+`~/.claude/settings.json` is silently ignored. To change it, edit
+`ccbox-statusline` and rebuild.
+
 Three settings are deliberately **not** set, each because it would break
 something this image relies on:
 
@@ -93,5 +100,5 @@ One collision worth knowing about: `Edit(~/.claude/settings.json)` also blocks
 the `update-config` skill, which exists to edit that file. That is the intended
 trade — the agent should not be able to widen its own permissions — but it fails
 visibly rather than gracefully. Drop that one line if you'd rather keep the
-skill working; the two `/workspace/.claude/...` rules are the ones that matter
+skill working; the two `/workspace/*/.claude/...` rules are the ones that matter
 against a hostile repo.

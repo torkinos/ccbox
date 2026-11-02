@@ -38,6 +38,24 @@ FIREWALL="${CCBOX_FIREWALL:-}"            # "on" enables the egress allowlist
 ALLOWLIST="${CCBOX_ALLOWLIST_FILE:-}"     # host file of extra allowed host names
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Where $PWD is mounted inside the container: /workspace/<name>-<hash>.
+#
+# Claude Code keys session history, auto-memory and per-project state on the
+# working directory's path. With every project mounted at plain /workspace on
+# the shared home volume, they all collapsed into one "-workspace" project, so
+# `ccbox -c` in one repo could resume another repo's conversation. The basename
+# keeps the path readable; a hash of the full host path keeps ~/a/api and
+# ~/b/api apart. cksum is POSIX, so the result is the same on macOS and Linux.
+workspace_dir() {
+  local here base sum
+  here="$(pwd -P)"
+  # Only characters that are safe in a mount path and a container name.
+  base="$(basename "$here" | tr -c 'A-Za-z0-9._\n-' '-')"
+  case "$base" in ''|*[!-]*) ;; *) base=root ;; esac   # "/" or nothing usable
+  sum="$(printf '%s' "$here" | cksum | cut -d' ' -f1)"
+  printf '/workspace/%s-%08x\n' "$base" "$sum"
+}
+
 # PORT: upstream enforces rootless podman here, because rootful podman ignores
 # --userns=keep-id and the workspace mount ends up unwritable. Docker has no
 # such mode, so this just confirms the daemon is reachable.
@@ -56,9 +74,9 @@ engine() {
 #
 # Emitted once and consumed twice — as `docker -v` flags, and as `claude
 # --add-dir` arguments — so the two views can never drift apart. Extra dirs land
-# under /mnt/<name>, deliberately outside /workspace: a mount nested inside the
-# workspace bind mount would materialise its mountpoint in your actual project
-# directory on the host.
+# under /mnt/<name>, deliberately outside the workspace: a mount nested inside
+# the workspace bind mount would materialise its mountpoint in your actual
+# project directory on the host.
 dir_specs() {
   local spec path name base opts n seen=$'\n'
   local IFS=','
@@ -89,7 +107,7 @@ dir_specs() {
     path="$(cd "$path" && pwd -P)"
 
     if [ "$path" = "$PWD" ]; then
-      echo "ccbox: CCBOX_DIRS: skipping $spec (already mounted at /workspace)" >&2
+      echo "ccbox: CCBOX_DIRS: skipping $spec (it is already the workspace)" >&2
       continue
     fi
 
@@ -185,8 +203,8 @@ inbound_ports() {
 #
 # Git worktrees: launch ccbox from the main repo root (not from inside a
 # worktree dir) so the repo — including worktrees nested under it, e.g.
-# .claude/worktrees/<name> — is mounted as a unit at /workspace. The bundled
-# git defaults to worktree.useRelativePaths, so worktrees created in the
+# .claude/worktrees/<name> — is mounted as a unit at its workspace path. The
+# bundled git defaults to worktree.useRelativePaths, so worktrees created in the
 # container record relative links and resolve both here and on the host.
 run_flags() {
   # PORT: upstream passes --userns=keep-id:uid=1000,gid=1000 so files written
@@ -220,13 +238,28 @@ run_flags() {
     relabel=":z"
   fi
 
+  # --init runs a minimal init (tini) as PID 1, so Claude Code is not PID 1:
+  # orphaned processes left by Bash tool calls get reaped instead of piling up
+  # as zombies, and `docker stop` / SIGTERM reach Claude instead of being
+  # ignored for 10 s and then SIGKILLed.
+  #
+  # --name and --label make sessions findable: `docker ps --filter label=ccbox`
+  # lists them, and the name says which project each one is. $$ is this
+  # launcher's PID (bash keeps it in subshells), so two sessions in the same
+  # directory never collide.
+  local workdir
+  workdir="$(workspace_dir)"
+
   printf '%s\n' \
-    --rm -it \
+    --rm -it --init \
+    --name "ccbox-${workdir##*/}-$$" \
+    --label ccbox=1 \
+    --label "ccbox.dir=$PWD" \
     ${userflag[@]+"${userflag[@]}"} \
     --network "$NET" \
-    -v "$PWD":/workspace"$relabel" \
+    -v "$PWD":"$workdir$relabel" \
     -v "$VOLUME":/home/node \
-    -w /workspace
+    -w "$workdir"
 
   # Socket Firewall (CCBOX_SOCKET=on). Independent of CCBOX_FIREWALL and
   # forwarded either way — the entrypoint reads it and prepends the shim dir to
@@ -238,11 +271,13 @@ run_flags() {
     printf '%s\n%s\n' --env CCBOX_SOCKET
   fi
 
-  # Egress firewall (CCBOX_FIREWALL=on). NET_ADMIN is for the entrypoint alone;
-  # by the time Claude Code starts, setpriv has dropped it along with the whole
-  # capability bounding set. no-new-privileges closes the other half of that
-  # door: the base image ships eight setuid-root binaries, and a root-owned
-  # setuid exec would otherwise regain everything in CapBnd, NET_ADMIN included.
+  # Egress firewall (CCBOX_FIREWALL=on). NET_ADMIN is for root-owned processes
+  # only: the entrypoint, the background re-resolver, and the --init process.
+  # The tree that runs Claude Code has it dropped — setpriv empties the whole
+  # capability bounding set before exec. no-new-privileges closes the other
+  # half of that door: the base image ships eight setuid-root binaries, and a
+  # root-owned setuid exec would otherwise regain everything in CapBnd,
+  # NET_ADMIN included.
   #
   # Bare `--env NAME` (no =value) makes docker read the value from this shell,
   # the same trick CCBOX_ENV uses below — it keeps values out of `ps` and shell
@@ -440,9 +475,12 @@ npm supply-chain firewall (opt-in, off by default):
   SOCKET_API_TOKEN        Enterprise seats only; the image ships the free
                           build. Forward with CCBOX_ENV=SOCKET_API_TOKEN.
 
-The current directory is bind-mounted at /workspace; nothing else from the
-host is mounted unless you ask for it via CCBOX_DIRS or CCBOX_SKILLS.
+The current directory is bind-mounted at /workspace/<name>-<hash>, a path of
+its own, so each project keeps its own history and memory; nothing else from
+the host is mounted unless you ask for it via CCBOX_DIRS or CCBOX_SKILLS.
 Credentials live in the named volume (default "ccbox-home"), never on the host.
+Sessions are named ccbox-<name>-<hash>-<pid>; list them with
+  docker ps --filter label=ccbox
 EOF
 }
 

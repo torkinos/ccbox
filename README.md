@@ -7,8 +7,12 @@ an SSH key live in a named Docker volume and never touch your host home.
 ## Features
 
 - **One-directory blast radius** — the agent sees the directory you launch
-  from, mounted at `/workspace`, and nothing else from your host. Widen it
-  deliberately with [`CCBOX_DIRS`](docs/directories.md), read-only if you like.
+  from, mounted at `/workspace/<name>-<hash>`, and nothing else from your host.
+  Widen it deliberately with [`CCBOX_DIRS`](docs/directories.md), read-only if
+  you like. Each directory gets its own path, so each keeps its own history
+  and memory.
+- **Status line** — model, context window use, and your claude.ai 5-hour and
+  7-day usage limits with time to reset, under the prompt.
 - **Credentials in a volume, not your home** — sign in once with `ccbox auth`;
   logins and an SSH key persist in a named volume you can swap or destroy.
   Separate volumes give you [separate identities](docs/environments.md).

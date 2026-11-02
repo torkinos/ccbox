@@ -12,6 +12,12 @@
     "CLAUDE_CODE_PLUGIN_SEED_DIR": "/opt/claude-code/plugin-seed"
   },
 
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/ccbox-statusline",
+    "refreshInterval": 60
+  },
+
   "permissions": {
     "deny": [
       "Read(~/.config/gh/hosts.yml)",
@@ -22,7 +28,7 @@
       "Read(~/.gnupg/**)",
       "Read(~/.netrc)",
       "Read(~/.docker/config.json)",
-      "Read(//workspace/.env)",
+      "Read(//workspace/*/.env)",
       "Read(//workspace/**/.env)",
 
       "Edit(~/.config/gh/hosts.yml)",
@@ -38,8 +44,8 @@
       "Bash(gh auth status --show-token*)",
 
       "Edit(~/.claude/settings.json)",
-      "Edit(//workspace/.claude/settings.json)",
-      "Edit(//workspace/.claude/settings.local.json)",
+      "Edit(//workspace/*/.claude/settings.json)",
+      "Edit(//workspace/*/.claude/settings.local.json)",
       "Edit(//etc/claude-code/**)",
 
       "Edit(~/.claude/plugins/**)",

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# ccbox-statusline — the status line under Claude Code's prompt: model, context
+# window use, and claude.ai usage limits.
+#
+#   Opus 5.5 · ctx 42% 84k/200k · 5h 23% (2h10m) · 7d 41% (3d4h)
+#
+# The times in brackets count down to that window's reset; managed settings
+# re-run this every 60 s so they keep moving while the session is idle.
+# Percentages are green below 70, yellow below 90, red from 90.
+#
+# Wired up in managed-settings.json, and it has to be: allowManagedHooksOnly
+# (set in the same file) means Claude Code only runs a statusLine that comes
+# from managed settings, so one in ~/.claude/settings.json would silently never
+# run. Root-owned in /usr/local/bin for the same reason as the entrypoint.
+#
+# Input is Claude Code's status-line JSON on stdin. Any field can be null or
+# missing early in a session, and rate_limits only appears for Pro/Max
+# subscribers after the first response, so every segment is optional and a
+# missing one is left out rather than shown as zero.
+#
+# One jq process does everything: this runs after every assistant message, and
+# jq's `now` makes the countdown timezone-independent (the image runs in UTC
+# unless built with --build-arg TZ=...).
+
+exec jq -r '
+  def pct:   if type == "number" then floor else null end;
+  def color($p):
+    if   $p >= 90 then "\u001b[31m"
+    elif $p >= 70 then "\u001b[33m"
+    else               "\u001b[32m" end;
+  def shown($p): "\(color($p))\($p)%\u001b[0m";
+  def tokens:
+    if type != "number" then null
+    elif . >= 1000000 then "\((. / 100000 | floor) / 10)M"
+    elif . >= 1000    then "\(. / 1000 | floor)k"
+    else "\(floor)" end;
+  def countdown:
+    (. - now | floor) as $s
+    | if   $s <= 0     then "now"
+      elif $s >= 86400 then "\($s / 86400 | floor)d\(($s % 86400) / 3600 | floor)h"
+      elif $s >= 3600  then "\($s / 3600 | floor)h\(($s % 3600) / 60 | floor)m"
+      else                  "\(($s / 60 | floor) + 1)m" end;
+  def window($name):
+    if type != "object" then empty
+    else (.used_percentage | pct) as $p
+      | if $p == null then empty
+        else "\($name) \(shown($p))"
+             + (if (.resets_at | type) == "number"
+                then " (\(.resets_at | countdown))" else "" end)
+        end
+    end;
+
+  [ (.model.display_name // empty),
+
+    ( .context_window as $c
+      | ($c.used_percentage | pct) as $p
+      | ($c.total_input_tokens | tokens) as $used
+      | ($c.context_window_size | tokens) as $size
+      | if $p == null then "ctx --"
+        else "ctx \(shown($p))"
+             + (if $used and $size then " \($used)/\($size)" else "" end)
+        end ),
+
+    (.rate_limits.five_hour   | window("5h")),
+    (.rate_limits.seven_day   | window("7d")),
+    (.rate_limits.spend_limit | window("spend"))
+  ] | join(" · ")
+'

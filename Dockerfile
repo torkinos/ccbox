@@ -89,6 +89,12 @@ RUN claude plugin validate /opt/claude-code/plugin-seed/marketplaces/cc-marketpl
 # nothing in ~/.claude or a project's .claude/ can override it.
 COPY managed-settings.json /etc/claude-code/managed-settings.json
 
+# The status line (model, context use, usage limits). managed-settings.json
+# points at it; allowManagedHooksOnly means a statusLine from anywhere else
+# would never run. Root-owned, like everything that file refers to.
+COPY ccbox-statusline /usr/local/bin/ccbox-statusline
+RUN chmod 0755 /usr/local/bin/ccbox-statusline
+
 # --- egress firewall ------------------------------------------------------
 # Opt-in, off unless the launcher passes CCBOX_FIREWALL=on. Both scripts live in
 # root-owned /usr/local/bin — inside the image, never on a volume — so the

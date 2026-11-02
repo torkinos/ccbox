@@ -31,22 +31,25 @@ The rules are installed by a root entrypoint **before** Claude Code starts, and
 then the entrypoint drops to uid 1000 and execs it:
 
 ```
-docker run --user 0:0 --cap-add=NET_ADMIN --security-opt=no-new-privileges
-   └─ ccbox-entrypoint            uid 0, CAP_NET_ADMIN
-        ├─ ccbox-init-firewall    resolve → ipset → iptables → self-test
-        ├─ background re-resolver uid 0
-        └─ exec setpriv …         → claude, uid 1000, CapEff 0, CapBnd 0
+docker run --init --user 0:0 --cap-add=NET_ADMIN --security-opt=no-new-privileges
+   └─ docker-init (PID 1)           uid 0 — reaps zombies, forwards signals
+        └─ ccbox-entrypoint         uid 0, CAP_NET_ADMIN
+             ├─ ccbox-init-firewall resolve → ipset → iptables → self-test
+             ├─ background re-resolver uid 0
+             └─ exec setpriv …      → claude, uid 1000, CapEff 0, CapBnd 0
 ```
 
-`NET_ADMIN` exists only for the entrypoint. By the time your agent is running,
-`setpriv` has cleared the capability bounding set, so `NET_ADMIN` isn't merely
+`NET_ADMIN` stays with the root processes: the entrypoint, the re-resolver, and
+`docker-init`, which only waits for its child. By the time your agent is running,
+`setpriv` has cleared its capability bounding set, so `NET_ADMIN` isn't merely
 unheld — it is unreachable, even through the setuid-root binaries Debian ships.
-There is no `sudo`. Both scripts live in root-owned `/usr/local/bin` inside the
-image, never on a volume. Verify any of this yourself:
+There is no `sudo`, and uid 1000 can't signal or trace the root processes. Both
+scripts live in root-owned `/usr/local/bin` inside the image, never on a volume.
+Verify any of this yourself:
 
 ```bash
 CCBOX_FIREWALL=on ccbox shell
-grep -E 'CapEff|CapBnd|NoNewPrivs' /proc/1/status   # 0, 0, 1
+grep -E 'CapEff|CapBnd|NoNewPrivs' /proc/$$/status  # 0, 0, 1 — this shell, not PID 1
 iptables -L                                          # permission denied
 ```
 

@@ -102,6 +102,36 @@ case "$off_flags" in
   *)                   ok  "firewall off: no --security-opt is added" ;;
 esac
 
+# Every session: an init as PID 1, a findable name and label, and a workspace
+# path of its own so projects don't share one Claude Code history.
+want_wd="$( cd "$WORK" && source "$HERE/ccbox" && workspace_dir )"
+case "$off_flags" in
+  *" --init "*)        ok  "an init process runs as PID 1 (--init)" ;;
+  *)                   bad "an init process runs as PID 1 (--init)" ;;
+esac
+case "$off_flags" in
+  *"--label ccbox=1 "*) ok  "sessions are labelled ccbox=1" ;;
+  *)                    bad "sessions are labelled ccbox=1" ;;
+esac
+case "$off_flags" in
+  *"--name ccbox-${want_wd##*/}-"*) ok  "sessions are named after the project" ;;
+  *)                                bad "sessions are named after the project" ;;
+esac
+case "$want_wd:$off_flags" in
+  /workspace/?*:*" -v $WORK:$want_wd"*" -w $want_wd "*)
+    ok  "the project is mounted at its own path and Claude starts there ($want_wd)" ;;
+  *)
+    bad "the project is mounted at its own path and Claude starts there (got: $want_wd)" ;;
+esac
+twin_a="$WORK/a/same"; twin_b="$WORK/b/same"
+mkdir -p "$twin_a" "$twin_b"
+if [ "$( cd "$twin_a" && source "$HERE/ccbox" && workspace_dir )" != \
+     "$( cd "$twin_b" && source "$HERE/ccbox" && workspace_dir )" ]; then
+  ok  "two directories with the same name get different paths"
+else
+  bad "two directories with the same name get different paths"
+fi
+
 off_probe="$(ccbox_sh '
   printf "uid=%s home=%s code=%s\n" \
     "$(id -u)" "$HOME" \
@@ -187,7 +217,9 @@ BATCH='
   echo "EXAMPLE4=$e4 EXAMPLE6=$e6 ANTHROPIC=$an NPM=$np GHRAW=$gh DNS=$dns"
   echo "SSH22=$sh22 SUDO=$sudo IPTABLES=$ipt IPSET=$ips"
   echo "UID=$(id -u) HOME=$HOME"
-  grep -E "^(CapEff|CapPrm|CapBnd|NoNewPrivs):" /proc/1/status \
+  # This shell, not PID 1: with --init, PID 1 is docker-init, which stays root.
+  # What matters is the tree that runs Claude Code, and this shell is in it.
+  grep -E "^(CapEff|CapPrm|CapBnd|NoNewPrivs):" /proc/$$/status \
     | sed "s/:[[:space:]]*/=/" | tr "\n" " "
   echo
   echo "LOGLINES=$(grep -c . /var/log/ccbox-firewall.log 2>/dev/null || echo 0)"
