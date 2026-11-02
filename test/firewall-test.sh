@@ -4,13 +4,18 @@
 #
 #   ./test/firewall-test.sh             hermetic tier: no credentials needed
 #   ./test/firewall-test.sh --with-auth also git-over-SSH and a real install,
-#                                       which need CCBOX_VOLUME to hold a
-#                                       working SSH key
+#                                       which need a volume holding a working
+#                                       SSH key: CCBOX_VOLUME_AUTH, default
+#                                       your real ccbox-home (read, not wiped)
 #   ./test/firewall-test.sh --build     rebuild the image first (slow: git is
 #                                       compiled from source)
 #
 # Needs outbound network on the host — the point is to prove that specific
 # destinations are reachable and others are not.
+#
+# Every CCBOX_* variable in your shell is ignored except CCBOX_IMAGE (which
+# image to test) and CCBOX_VOLUME_AUTH / CCBOX_TEST_REPO (--with-auth inputs),
+# so a profile that exports CCBOX_SKILLS or CCBOX_DIRS can't leak into a run.
 #
 # The launcher is SOURCED rather than reimplemented, so these assertions run
 # against the same run_flags() the real thing uses and cannot drift from it.
@@ -26,10 +31,24 @@ for arg in "$@"; do
   case "$arg" in
     --with-auth) WITH_AUTH=1 ;;
     --build)     BUILD=1 ;;
-    -h|--help)   sed -n '3,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)   sed -n '3,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)           echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
+
+# Start from a clean ccbox configuration. The launcher reads its settings from
+# the environment, and the docs suggest exporting some of them (CCBOX_SKILLS,
+# CCBOX_DIRS) in a shell profile: inherited, they would mount real host
+# directories into test containers and flip assertions such as "CCBOX_SOCKET
+# unset". Cleared by prefix rather than by list, so a variable added to the
+# launcher later is covered without anyone remembering to add it here.
+for v in $(compgen -e); do
+  case "$v" in
+    CCBOX_IMAGE|CCBOX_VOLUME_AUTH|CCBOX_TEST_REPO) ;;
+    CCBOX_*) unset "$v" ;;
+  esac
+done
+unset v
 
 PASS=0
 FAIL=0
@@ -55,12 +74,14 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 \
   || { echo "no such image: $IMAGE — run with --build" >&2; exit 1; }
 
 # A scratch workspace and a scratch home volume, so a test run never touches the
-# repo you launched from or the credentials in your real ccbox-home.
+# repo you launched from or the credentials in your real ccbox-home. Only
+# --with-auth reads a real volume (CCBOX_VOLUME_AUTH), and it is never removed:
+# cleanup deletes the scratch volume alone.
 WORK="$(mktemp -d)"
 TEST_VOLUME="ccbox-firewall-test"
 cleanup() {
   rm -rf "$WORK"
-  [ "$WITH_AUTH" = 1 ] || docker volume rm -f "$TEST_VOLUME" >/dev/null 2>&1 || true
+  docker volume rm -f "$TEST_VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -302,8 +323,15 @@ esac
 note "firewall ON — extending the allowlist from the host"
 # =============================================================================
 
-EXTRA="$(CCBOX_ALLOWED_DOMAINS=example.com ccbox_sh \
-  'curl -sS --max-time 20 -o /dev/null https://example.com && echo REACHED || echo BLOCKED' 2>/dev/null)"
+# Not example.com: the firewall's boot self-test proves the allowlist blocks
+# something by checking example.com is unreachable, and aborts if it isn't.
+# Allowlisting example.com would trip that self-test, the container would never
+# boot, and this check could never pass. Not example.org either: it sits on the
+# same CDN as example.com, so the two could share an address and trip the
+# self-test the same way. www.debian.org is self-hosted, off the default
+# allowlist, and stable.
+EXTRA="$(CCBOX_ALLOWED_DOMAINS=www.debian.org ccbox_sh \
+  'curl -sS --max-time 20 -o /dev/null https://www.debian.org && echo REACHED || echo BLOCKED' 2>/dev/null)"
 case "$EXTRA" in
   *REACHED*) ok  "CCBOX_ALLOWED_DOMAINS widens the allowlist" ;;
   *)         bad "CCBOX_ALLOWED_DOMAINS widens the allowlist (got: $EXTRA)" ;;
@@ -319,7 +347,7 @@ note "Socket Firewall (CCBOX_SOCKET)"
 
 # Off is off. The assertion that this is genuinely opt-in rather than merely
 # documented as such.
-sock_off="$( (unset CCBOX_FIREWALL; ccbox_sh 'command -v npm') 2>/dev/null )"
+sock_off="$( (unset CCBOX_FIREWALL CCBOX_SOCKET; ccbox_sh 'command -v npm') 2>/dev/null )"
 case "$sock_off" in
   */usr/local/bin/npm) ok  "CCBOX_SOCKET unset: npm is the real npm, PATH untouched" ;;
   *)                   bad "CCBOX_SOCKET unset: npm is the real npm (got: $sock_off)" ;;
